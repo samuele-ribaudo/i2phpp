@@ -1,0 +1,26 @@
+{
+  "dimension": 1,
+  "output": {
+    "frequency": 100,
+    "enable": true
+  },
+  "thermal diffusivity": {
+    "constant thermal diffusivity": true,
+    "base_diffusivity": 1e-1
+  },
+  "boundary conditions": {
+    "T left": 303,
+    "T right": 303
+  },
+  "initial temperature": 403,
+  "domain": {
+    "length": 1
+  },
+  "discretization": {
+    "nx dofs": 100
+  },
+  "time stepping": {
+    "end time": 5,
+    "time increment": 0.0001
+  }
+}

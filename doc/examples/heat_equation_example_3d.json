@@ -1,0 +1,35 @@
+{
+  "dimension": 3,
+  "output": {
+    "frequency": 100,
+    "enable": true,
+    "layer": 2
+  },
+  "thermal diffusivity": {
+    "constant thermal diffusivity": true,
+    "base_diffusivity": 1e-2
+  },
+  "boundary conditions": {
+    "T left": 273,
+    "T right": 303,
+    "T bottom": 293,
+    "T front": 330,
+    "T back": 300,
+    "T top": 323
+  },
+  "initial temperature": 500,
+  "domain": {
+    "length": 1,
+    "height": 1,
+    "width": 1
+  },
+  "discretization": {
+    "nx dofs": 10,
+    "ny dofs": 10,
+    "nz dofs": 10
+  },
+  "time stepping": {
+    "end time": 0.5,
+    "time increment": 0.001
+  }
+}
