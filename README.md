@@ -295,3 +295,157 @@ HeatOperator<dim, number, LaVector<number, native_simd::size()>, LaMatrix<number
 | **Matrix-Matrix (A*B) | i to k to j loop structure | Reads matrix B along contiguous row entries, eliminating strided column loads.|
 | **`trace()` Vectorization** | Omitted (Scalar loop used)| Diagonal elements are non-contiguous; strided SIMD gathering incurs high overhead.|
 | **Performance Limits** | Bandwidth Bottleneck (Memory Wall) | Matrix-vector multiplications are memory-bound; speedup plateaus at wide SIMD widths.|
+
+---
+
+# THREADS
+
+
+## I. Theoretical Concepts & Architecture Takeaways
+
+### 1. Architectural Classification
+
+* **Flynn’s Taxonomy:** Multithreading falls under **MIMD** (Multiple Instruction, Multiple Data).
+* **Memory Model:** Operates on **Shared Memory Systems**. All threads within a process share the same global address space.
+
+### 2. Program vs. Process vs. Thread
+
+* **Program:** A passive set of instructions stored on disk.
+* **Process:** An executing instance of a program. Has its own isolated memory address space (Code, Data, Heap, File descriptors). Inter-process communication (IPC) is heavy and slow.
+* **Thread:** The smallest lightweight unit of execution within a process.
+
+| Component | Shared Across Threads in Process | Private to Each Thread |
+| --- | --- | --- |
+| **Memory / State** | Heap, Code Segment, Data Segment, Open Files | **Stack**, **Registers**, **Program Counter (PC)** |
+
+### 3. Thread Scheduling & Lifecycle
+
+* **Scheduling:** Managed by the OS Kernel. Uses context switches to assign CPU time slices to threads in the *Ready Queue*.
+* **Lifecycle:**
+1. **Creation:** Memory/stack allocated.
+2. **Execution:** Scheduled and executed on CPU cores.
+3. **Joining/Termination:** Waiting for completion and releasing thread resources.
+
+
+
+---
+
+## II. Live-Coding Code Syntax & API Reference
+
+### 1. Basic Thread Management (`thread_basics.cpp`)
+
+* **Header:** `#include <thread>`
+* **Thread Creation & Joining:**
+```cpp
+std::thread t(func_name, arg1, arg2); // Launches thread immediately
+t.join();                            // Main thread blocks until 't' completes
+
+```
+
+
+* **Passing References (`std::ref` / `std::cref`):**
+`std::thread` constructors copy/move arguments by default. To pass variables by reference or const reference, wrap them in `std::ref()` or `std::cref()`:
+```cpp
+std::thread t(lambda_expr, std::ref(var1), std::cref(var2));
+
+```
+
+
+* **`std::jthread` (C++20):**
+RAII-compliant thread wrapper. Automatically calls `.join()` on destruction (going out of scope), preventing resource leaks or process termination:
+```cpp
+{
+    std::jthread jt(func_name, arg1, arg2); 
+} // Automatically joined here
+
+```
+
+
+* **Detaching:**
+```cpp
+t.detach(); // Separates execution from object; runs independently in background.
+
+```
+
+
+
+---
+
+### 2. Race Conditions & Synchronization (`race_condition.cpp`, `mutex_example.cpp`, `lock_guard_example.cpp`)
+
+* **Race Condition:** Occurs when multiple threads access shared memory concurrently without synchronization, and at least one access is a write. Results in non-deterministic, corrupted state.
+* **Manual Mutex (`std::mutex`):**
+```cpp
+#include <mutex>
+std::mutex mtx;
+
+mtx.lock();   // Critical Section (Only 1 thread at a time)
+++counter;
+mtx.unlock(); 
+
+```
+
+
+*Oral Exam Pitfall:* Manual `.lock()`/`.unlock()` is **not exception-safe**. If an exception occurs inside the critical section, the mutex remains locked forever (deadlock).
+* **RAII Mutex Management (`std::lock_guard`):**
+Locks on construction, automatically unlocks on destruction (exit scope / exception). Always prefer this over raw lock/unlock:
+```cpp
+{
+    std::lock_guard<std::mutex> lock(mtx); // Locks mtx
+    ++counter;                             // Critical section
+} // Unlocks automatically here
+
+```
+
+
+
+---
+
+### 3. Deadlocks (`deadlock_example.cpp`)
+
+* **Definition:** A scenario where two or more threads are permanently blocked, each waiting for a mutex held by the other.
+* **Cause in Code:** Lock acquisition in mismatched order across different threads:
+* Thread 1 locks `mtx1` $\rightarrow$ requests `mtx2`
+* Thread 2 locks `mtx2` $\rightarrow$ requests `mtx1`
+
+
+* **Oral Exam Fix:** Always acquire locks in the **exact same linear order** across all threads (or use `std::scoped_lock` in C++17 to acquire multiple locks atomically).
+
+---
+
+### 4. Thread Communication (`condition_variable_example.cpp`)
+
+* **Header:** `#include <condition_variable>`
+* **Concept:** Allows threads to sleep until notified by another thread that a condition/data is ready.
+* **Key Syntax:**
+```cpp
+std::mutex mtx;
+std::condition_variable cv;
+bool ready = false;
+
+// --- Consumer Thread ---
+std::unique_lock<std::mutex> lock(mtx); // cv requires unique_lock (can lock/unlock dynamically)
+cv.wait(lock, [&] { return ready; });  // Releases lock & sleeps until notified AND ready==true
+
+// --- Producer Thread ---
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    ready = true;
+}
+cv.notify_one(); // Unblocks one waiting thread (or cv.notify_all())
+
+```
+
+
+* **Spurious Wakeup Handling:** `cv.wait()` must always pass a boolean predicate (`[&]{ return ready; }`) to prevent execution continuing if woken up by the OS without a valid notification.
+
+---
+
+## III. Summary Checklist for the Oral Exam
+
+1. **Difference between Stack and Heap in Multithreading:** Each thread gets its own isolated stack. The heap is shared among all threads of the same process.
+2. **Why use `std::ref` in thread arguments?** `std::thread` constructor passes arguments by value (copy) by default.
+3. **What happens if a `std::thread` is destroyed while still joinable?** `std::terminate()` is called, crashing the program.
+4. **Why prefer `std::lock_guard` over `std::mutex::lock()`?** To enforce RAII and ensure exception safety (guaranteed unlock on stack unwinding).
+5. **How to avoid Deadlocks?** Acquire multiple locks in a strict global sequence across all threads.
+6. **Why is a predicate mandatory in `std::condition_variable::wait()`?** To guard against **spurious wakeups** (threads waking without an explicit notification).
