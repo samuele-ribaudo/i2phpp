@@ -1,5 +1,3 @@
-keep the document as it is, but write alle the stuff in between $$ in readable plain text. Eg A*B, A^B ecc.  the output should be the complete text that i can just copy and paste.
-
 # SIMD
 
 ## 1. Fundamentals of SIMD Architecture
