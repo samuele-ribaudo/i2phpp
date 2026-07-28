@@ -1,82 +1,299 @@
-# Introduction to Parallel High Performance Programming - Code Base
+keep the document as it is, but write alle the stuff in between $$ in readable plain text. Eg A*B, A^B ecc.  the output should be the complete text that i can just copy and paste.
 
-![i2phpp_logo.png](doc/fig/i2phpp_logo.png)
+# SIMD
 
-## Installation Instructions
+## 1. Fundamentals of SIMD Architecture
 
-For compiling and running the code we use the terminal which as first glance is slightly more inconvenient but once you
-get used to it, though, it's easier than clicking buttons.
+* **Data-Level Parallelism:** Single Instruction, Multiple Data (SIMD) processes multiple data elements simultaneously using a single instruction executed across vector registers.
 
-#### Installation
+* **Flynn's Taxonomy:** SIMD falls under Flynn's classification alongside SISD (sequential), MISD, and MIMD (multicore/distributed).
 
-First, we need to configure the project. Let's assume the project folder is located at `<path-to-i2phpp>`. When you open
-the terminal, the first step is to change your working directory to the project folder:
+* **Native vs. Fixed-Size Registers:**
+* **Native ABI (`stdx::native_simd<T>`):** Scales automatically to the vector register width supported by the host CPU (e.g., 4 lanes for standard 32-bit integers on 128-bit ARM NEON/AVX registers).
 
-```
-cd <path-to-i2phpp>
-```
+* **Fixed-Size ABI (`stdx::fixed_size_simd<T, N>`):** Explicitly enforces an N-element vector length across any compilation target.
 
-Note that when opening the terminal from VSCode with VSCode being opened in the root directory of the project the current working directory of the new terminal is already correct. Next, we configure the project using a meta-build tool called **CMake**. If you're curious, you can take a look at the `CMakeLists.txt` file, which contains the cmake code that describes the project setup. However, for the purpose of this course, you can also simply let the cmake magic do its job by simply running:
+---
 
-```
-cmake --preset=<build-type> .
-```
+## 2. Construction & Initialization
 
-Replace `<build-type>` with either `release` or `debug`, depending on your needs. The `release` mode tells the compiler
-to optimize the code, which is useful when running benchmarks. If you're tracking down a bug, `debug` mode is your best
-friend ;) — it allows you to use a debugger to analyze the code's behavior.
+* **Broadcast Initialization:** Initializing a vector with a single scalar assigns that value across all lanes simultaneously (e.g., `stdx::native_simd<int> simd(73)` fills all lanes with `73`).
 
-Once cmake finishes configuring the project, a new folder named `build/` will appear in your project directory. Inside
-it, you'll find two subfolders: `release/` and `debug/`. If you only configured the project in one mode, you’ll only see the corresponding folder.
+* **Generator Constructor:** Initializing via a lambda function calls the lambda once per lane, passing the lane's index i as an argument (e.g., `[](int i) { return i; }` produces `[0, 1, 2, 3]`).
 
-The next step is to compile the code. Based on your chosen mode, navigate to the appropriate subdirectory. For example,
-if you configured the project in `release` mode:
+---
 
-```
-cd build/release
-```
+## 3. Data Transfer & Memory Alignment
 
-Now, compile the code by running:
+* **Element-Aligned Access (`stdx::element_aligned`):** Used when loading or storing data from standard, unaligned memory boundaries (e.g., standard `std::array` or `std::vector`).
 
-```
-ninja -j <n_processes>
-```
+* **Vector-Aligned Access (`stdx::vector_aligned`):** Requires memory to be aligned to vector boundaries using `alignas(...)` with `stdx::memory_alignment_v<SimdType>`. Enforces hardware-level aligned load/store instructions for optimal CPU execution speed.
 
-The `<n_processes>` parameter specifies how many compilation processes run in parallel. The ideal number depends on your
-hardware and the project size. If you're unsure, `8` is generally a safe choice on modern systems. Once the command
-finishes, the code is compiled and ready to run.
+* **Member Functions:** `copy_from(ptr, alignment_tag)` loads memory into CPU registers, and `copy_to(ptr, alignment_tag)` writes SIMD register contents back to memory.
 
-Note that you’ll need to recompile whenever you change your code. Reconfiguration with cmake is only necessary if you
-modify `CMakeLists.txt`, add new source (`.cpp`) files, or change compiler flags. This won’t be required for the
-exercises or worksheets unless explicitly mentioned. Of course, feel free to explore on your own!
+---
 
-#### Running the Tests
+## 4. Key SIMD Utility & Standard Functions
 
-Once the code is compiled, you can run tests to verify your implementation and ensure modifications remain correct. The
-test executables are located in the directory `<path-to-i2hpp>/build/<build-type>/tests`. Assuming your current working
-directory is `build/<build-type>`, run a test with:
+### Splitting and Fusing Operations
 
-```bash
-mpiexec -np <num_processes> ./tests/<test-name>
-```
+* **`stdx::split<N1, ... N2,>(v)`:** Decomposes a larger SIMD register into structured bindings of smaller SIMD vectors.
 
-Replace `<num_processes>` with the number of desired processes, and `<test-name>` with the name of the test executable you want to run, such as `pi_estimation_test`. The terminal output will tell you whether the test passed or failed, and will provide details if it failed.
+* **`stdx::concat(v1, v2, ...)`:** Combines multiple smaller SIMD vectors into a single wider register.
 
-#### Running the Heat Equation Application
+### Comparisons & Reductions
 
-Besides the tests, you can also run the heat equation solver to tackle a more physically relevant problem. The solver is
-compiled alongside the tests, so no additional compilation is needed. Assuming your current directory is `build/`, the
-solver executable is located in the `applications/` folder.
+* **`stdx::minmax(x1, x2)`:** Performs element-wise lane comparisons between two vectors simultaneously and returns a structured tuple `[min, max]` containing the element-wise minimums and maximums.
 
-To run the solver, you need a `.json` input file specifying parameters such as boundary conditions. You can find an
-example input file in `<path-to-i2phpp>/doc/examples`.
+* **`stdx::reduce(simd, binary_op)`:** Performs horizontal reduction across all lanes within a vector register (e.g., combining lanes using `std::plus{}` to sum all internal elements).
 
-Suppose you have an input file named `my_exciting_input.json` in `<example-directory>`. From the `build/` directory, run
-the
-solver with:
+---
+
+## 5. Branching & Masking Logic
+
+* **Divergence Handling:** SIMD hardware cannot execute standard `if/else` conditional jumps per element without breaking parallel execution.
+
+* **Mask Vectors (`stdx::native_simd_mask<T>`):** Storing conditional expressions (e.g., `mask = simd > 0`) creates a boolean mask vector.
+
+* **Conditional Writes (`stdx::where`):** Standard conditional updates write results back to selective lanes using masked predicates:
+```cpp
+// Multiplies vector values by 2 and writes back ONLY where mask is true
+stdx::where(mask, simd).copy_to(&vec[i], stdx::vector_aligned);
 
 ```
-./applications/heat_equation <example-directory>/my_exciting_input.json
+---
+
+# WORKSHEET 1 BREAKDOWN
+
+## 1. Task 1: Vector Class Vectorization (`LaVector<number, N>`)
+
+### The Class Template Signature
+
+```cpp
+template <typename number, int N = 1>
+class LaVector;
+
 ```
 
-**Disclaimer:** Due to a parallel processing bug, output is currently unavailable. We apologize for the inconvenience. If you're looking for an extra challenge, feel free to tackle this issue as part of your bonus project!
+* **`number`**: Primitive data type (`float`, `double`, `int`).
+
+* **`N`**: Vectorization width (number of lanes per SIMD register). Default `1` preserves scalar fallback.
+
+---
+
+### Implementation Pattern: Main Loop + Masked Remainder
+
+In `la_vector.hpp`, vector operations (`operator+=`, `operator-=`, `operator*=`, `operator/=`, `schur_product`) follow a standardized SIMD pattern:
+
+```cpp
+// 1. Calculate Upper Bound and Remainder
+const std::size_t ub        = this->size() - (this->size() % N);
+const std::size_t remainder = this->size() % N;
+
+// 2. Vectorized Main Loop
+for (std::size_t i = 0; i < ub; i += N) {
+    stdx::fixed_size_simd<number, N> x_simd(&data[i], stdx::element_aligned);
+    stdx::fixed_size_simd<number, N> y_simd(&vec.data[i], stdx::element_aligned);
+    x_simd += y_simd;
+    x_simd.copy_to(&data[i], stdx::element_aligned);
+}
+
+// 3. Masked SIMD Remainder Loop
+if (remainder > 0) {
+    stdx::fixed_size_simd_mask<number, N> mask(false);
+    for (std::size_t i = 0; i < remainder; ++i)
+        mask[i] = true;
+
+    stdx::fixed_size_simd<number, N> x_simd(0);
+    stdx::fixed_size_simd<number, N> y_simd(0);
+
+    stdx::where(mask, x_simd).copy_from(&data[ub], stdx::element_aligned);
+    stdx::where(mask, y_simd).copy_from(&vec.data[ub], stdx::element_aligned);
+
+    x_simd += y_simd;
+
+    stdx::where(mask, x_simd).copy_to(&data[ub], stdx::element_aligned);
+}
+
+```
+
+#### Why did you implement it this way?
+
+1. **`stdx::element_aligned` vs `stdx::vector_aligned`**: The underlying container is `std::vector<number>`. Since `std::vector` allocations on the heap are not guaranteed to be aligned to SIMD register boundaries (e.g., 32-byte or 64-byte alignment), using `stdx::element_aligned` prevents unaligned memory access faults.
+
+2. **Masked Remainder Vectorization (`stdx::where`)**: Instead of a scalar fallback loop for the leftover elements (`size % N`), you used `stdx::fixed_size_simd_mask`. `stdx::where(mask, ...)` conditionally loads and writes back only the active lanes where the mask is `true`, leaving out-of-bound memory untouched.
+
+---
+
+### Reductions & Norms
+
+For operations like `l2_norm_squared()`, `norm_l1()`, and `norm_linf()`:
+
+* You accumulate values inside a single SIMD vector register (`acc_simd`) across the entire loop.
+
+* At the end, you collapse the vector lanes into a single scalar value using **horizontal reduction** (`stdx::reduce` or `stdx::hmax`):
+
+```cpp
+// Horizontal sum across SIMD vector lanes
+return stdx::reduce(acc_simd, std::plus<>()); 
+
+```
+
+---
+
+### Oral Exam Defense Questions (Task 1)
+
+#### Q1: Why can an incorrect loop bound (reading beyond array size) work without crashing during testing? Why is it unsafe?
+
+* **Why it doesn't crash**: Memory is allocated in virtual pages (typically 4 KB) by the OS, and `std::vector` allocates heap capacity in chunks. If an out-of-bounds SIMD load accesses bytes that lie within the same memory page or allocated capacity, no hardware fault occurs.
+
+* **Why it's dangerous**:
+1. **Undefined Behavior (UB)**: Reading uninitialized or out-of-bounds data.
+
+2. **Page Faults / Crashes**: If a vector ends near a page boundary, a 128-bit/256-bit SIMD load that crosses into an unmapped page will trigger a **Segmentation Fault (`SIGSEGV`)**.
+
+3. **Data Pollution**: If masked stores are not used, invalid data gets written back to memory.
+
+---
+
+## 2. Task 2: Matrix Class Vectorization (`LaMatrix<number, N>`)
+
+### Internal Storage Layout
+
+```cpp
+std::vector<std::vector<number>> data;
+
+```
+
+* **Memory Structure**: A vector of dynamic vectors.
+
+* **Layout Implication**: Each individual row is contiguous in memory. However, **different rows are separate heap allocations and NOT contiguous with each other**.
+
+---
+
+### A. Element-Wise Operations & Matrix-Vector Multiplication
+
+For Matrix-Vector product ($y = A \cdot x$):
+
+```cpp
+for (std::size_t row_idx = 0; row_idx < rows(); ++row_idx) {
+    std::size_t idx = 0;
+    number sum(0.0);
+    for (; idx + simd_width <= cols(); idx += simd_width) {
+        simd_type row_vec(&data[row_idx][idx], stdx::element_aligned);
+        simd_type vec_elements(&vec[idx], stdx::element_aligned);
+        simd_type product = row_vec * vec_elements;
+        sum += stdx::reduce(product);
+    }
+    // Scalar loop for column remainder
+    for (; idx < cols(); ++idx) {
+        sum += (*this)[row_idx, idx] * vec[idx];
+    }
+    result[row_idx] = sum;
+}
+
+```
+
+* **Explanation**: You iterate through matrix rows. Since row elements $A_{i, j \dots j+N}$ are contiguous in memory, you perform element-wise SIMD multiplication with vector chunk $x_{j \dots j+N}$ and horizontally sum the results into a scalar accumulator.
+
+---
+
+### B. Matrix-Matrix Product Optimization ($C = A \cdot B$)
+
+Standard matrix multiplication ($C_{i, j} = \sum_k A_{i, k} B_{k, j}$) processes matrix $B$ column-wise. Because `LaMatrix` stores rows independently, column accesses in $B$ are non-contiguous, leading to severe cache miss penalties.
+
+#### Your Implementation (Loop Reordering $i \to k \to j$):
+
+```cpp
+for (std::size_t row_idx = 0; row_idx < rows(); ++row_idx)          // i
+    for (std::size_t idx = 0; idx < cols(); ++idx) {                // k
+        number a_scalar = (*this)[row_idx, idx];                    // A[i][k]
+        std::size_t col_idx = 0;
+        for (; col_idx + simd_width <= mat.cols(); col_idx += simd_width) { // j
+            simd_type b_vec(&mat.data[idx][col_idx], stdx::element_aligned);
+            simd_type res_vec(&result.data[row_idx][col_idx], stdx::element_aligned);
+            
+            res_vec += a_scalar * b_vec;
+            
+            res_vec.copy_to(&result.data[row_idx][col_idx], stdx::element_aligned);
+        }
+        // remainder processing...
+    }
+
+```
+
+#### Why did you implement it this way?
+
+1. **Scalar Broadcasting**: You pick a single scalar value $A_{i, k}$.
+
+2. **Contiguous Access on Matrix B**: By vectorizing the innermost loop over $j$ (columns of $B$), you read row $k$ of matrix $B$ (`mat.data[idx][col_idx]`) as a **contiguous chunk** in memory.
+
+3. **Cache Efficiency**: Every vectorized load from matrix $B$ is linear and fully utilizes cache lines.
+
+---
+
+### Oral Exam Defense Questions (Task 2)
+
+#### Q1: Why is `trace()` computation NOT vectorized in your code?
+
+* **Definition**: $\text{Trace}(A) = \sum_{i=0}^{M-1} A_{i, i}$.
+
+* **Reason**: Diagonal elements $A_{0,0}, A_{1,1}, A_{2,2}, \dots$ are separated by a stride of $(\text{Cols} + 1)$ elements in continuous storage, or reside in completely disjoint `std::vector` allocations per row.
+
+* **Conclusion**: SIMD registers require contiguous memory blocks for efficient loads. Gathering non-contiguous diagonal elements requires strided loads or gather instructions (`vpgatherd`), which incur higher latency than standard scalar addition.
+
+#### Q2: Bonus Question — Cache Line Size vs. Vectorization Width Trade-off in GEMM?
+
+* **Favorable Configuration**: When the total width of a SIMD register matches or cleanly divides the CPU **cache line size** (typically 64 bytes). For example, a 512-bit register (64 bytes = 8 `double`s) fills exactly one cache line per load operation.
+
+* **Unfavorable Configuration**:
+* If vector width exceeds cache line boundaries without alignment, memory loads split across multiple cache lines, causing cache lock stalls.
+
+* If matrices $A, B, C$ are very large and do not fit in L1/L2 cache, row-reuse strategies break down unless combined with **Cache Tiling / Blocking** techniques.
+
+---
+
+## 3. Task 3: The Heat Operator & Solver (`HeatOperator`)
+
+In `heat_operator.hpp`, the explicit Euler time step advances as:
+
+$$\mathbf{T}^{(n+1)} = \mathbf{T}^{(n)} + \Delta t \cdot \left( \mathbf{A} \mathbf{T}^{(n)} + \mathbf{Q}^{(n)} \right)$$
+
+```cpp
+// Matrix-based Explicit Euler advancement
+current_solution +=
+    system_matrix * current_solution * current_time_increment +
+    source_term_vector(current_time - current_time_increment) *
+        current_time_increment;
+
+```
+
+### Key Connections to SIMD
+
+1. `system_matrix * current_solution`: Triggers the SIMD-vectorized **Matrix-Vector product** (`LaMatrix::operator*`).
+
+2. `current_solution += ...`: Triggers SIMD-vectorized **Vector addition and scalar scaling** (`LaVector::operator+=`).
+
+3. Instantiation in `heat_solver.hpp`:
+
+```cpp
+using native_simd = std::experimental::simd<number, std::experimental::simd_abi::native<number>>;
+
+HeatOperator<dim, number, LaVector<number, native_simd::size()>, LaMatrix<number, native_simd::size()>>
+
+```
+
+* The solver dynamically detects the native hardware SIMD lane width (`native_simd::size()`) for the target system.
+
+---
+
+## 4. Summary Table for Oral Exam Defense
+
+| Concept / Method | Implementation Details | Key Theory / Reason |
+| --- | --- | --- |
+| **`LaVector` Remainder** | `stdx::fixed_size_simd_mask` + `stdx::where`<br> | Avoids scalar loops; prevents out-of-bound memory access safely.|
+| **Memory Alignment** | `stdx::element_aligned`<br> | Data inside `std::vector` heap memory is not guaranteed vector-aligned.|
+| **Matrix Storage** | `std::vector<std::vector<T>>`<br> | Rows are contiguous individually, but non-contiguous relative to each other.|
+| **Matrix-Matrix (A*B) | i to k to j loop structure | Reads matrix B along contiguous row entries, eliminating strided column loads.|
+| **`trace()` Vectorization** | Omitted (Scalar loop used)| Diagonal elements are non-contiguous; strided SIMD gathering incurs high overhead.|
+| **Performance Limits** | Bandwidth Bottleneck (Memory Wall) | Matrix-vector multiplications are memory-bound; speedup plateaus at wide SIMD widths.|
