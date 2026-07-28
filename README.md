@@ -449,3 +449,241 @@ cv.notify_one(); // Unblocks one waiting thread (or cv.notify_all())
 4. **Why prefer `std::lock_guard` over `std::mutex::lock()`?** To enforce RAII and ensure exception safety (guaranteed unlock on stack unwinding).
 5. **How to avoid Deadlocks?** Acquire multiple locks in a strict global sequence across all threads.
 6. **Why is a predicate mandatory in `std::condition_variable::wait()`?** To guard against **spurious wakeups** (threads waking without an explicit notification).
+
+---
+
+# WORKSHEET 2: Thread Pool Implementation & Architecture Walkthrough
+
+
+## 1. Theoretical Motivation & Problem Statement
+
+### The Problem: Thread Creation Overhead
+
+In high-performance numerical computing (such as iterative solvers or Monte Carlo simulations), executing parallel tasks by repeatedly spawning (`std::thread t(...)`) and joining (`t.join()`) native threads introduces severe performance bottlenecks.
+
+* **OS Context Switching & Allocation Costs:** Creating a native C++ thread requires the operating system kernel to allocate dedicated stack memory (typically 1–8 MB) and manage kernel-level thread scheduling structures.
+
+
+* **High-Frequency Pitfall:** Spawning threads inside loops that execute millions of times causes the thread creation and destruction overhead to dominate actual computational execution time.
+
+
+
+### The Solution: The Thread Pool Pattern
+
+A **Thread Pool** resolves this overhead by instantiating a fixed set of $N$ persistent worker threads upon initialization.
+
+* **Task Reuse Model:** Threads are created **once** during program startup and kept alive in a sleeping state.
+
+
+* **Work Queue:** Tasks are represented as generic callable objects (`std::function<void()>`) and pushed into a shared First-In, First-Out (FIFO) queue (`std::queue`). Worker threads dynamically pull tasks from this queue, execute them, and return to sleep when idle.
+
+
+
+---
+
+## 2. Connection to Computer Architecture & Lecture Theory
+
+* **Flynn's Taxonomy:** Thread pools operate under the **MIMD** (Multiple Instruction, Multiple Data) architecture on **Shared Memory Systems**. All worker threads run within the address space of the parent process and share heap memory (the task queue, flags, counters).
+
+
+* **Private vs. Shared Memory:**
+* **Shared (Process Heap):** The task queue (`jobs`), synchronization primitives (`queue_mutex`, condition variables), worker handles vector (`workers`), and state trackers (`active_jobs`, `stop_thread_pool`).
+
+
+* **Private (Thread Stack):** Local variables created inside worker loops (e.g., the local `job` object retrieved from the queue).
+
+
+
+
+* **Resource Acquisition Is Initialization (RAII):** The lifetime of all worker threads is strictly bound to the lifetime of the `ThreadPool` object. Destructors guarantee graceful pool shutdown and join all threads, preventing dangling execution or system crashes.
+
+
+
+---
+
+## 3. Class Components Overview (`thread_pool.hpp`)
+
+| Member Variable | Data Type | Theoretical & Functional Role |
+| --- | --- | --- |
+| `workers` | `std::vector<std::thread>` | Container holding the persistent worker threads created at pool instantiation.
+
+ |
+| `jobs` | `std::queue<std::function<void()>>` | Thread-safe FIFO task queue storing pending computational jobs.
+
+ |
+| `queue_mutex` | `std::mutex` | Mutual exclusion lock protecting concurrent reads/writes to `jobs`, `active_jobs`, and flags.
+
+ |
+| `queue_condition` | `std::condition_variable` | Signals sleeping worker threads when a new task is enqueued or when shutdown begins.
+
+ |
+| `work_done_condition` | `std::condition_variable` | Signals calling threads blocked in `wait_for_all()` when all enqueued tasks complete.
+
+ |
+| `active_jobs` | `std::size_t` | Atomic/synchronized counter tracking the number of threads currently executing a job.
+
+ |
+| `stop_thread_pool` | `bool` | Boolean shutdown flag instructing worker threads to terminate their event loops.
+
+ |
+
+---
+
+## 4. Implementation Walkthrough & Code Breakdown
+
+### A. Constructor & Worker Event Loop
+
+The constructor validates thread counts and launches `num_threads` worker execution loops.
+
+```cpp
+inline ThreadPool::ThreadPool(const std::size_t num_threads)
+{
+  if (num_threads == 0)
+    throw std::invalid_argument("The number of threads must be greater than zero!");[cite: 6]
+
+  for (std::size_t i = 0; i < num_threads; ++i)
+    {
+      workers.emplace_back([this]() {
+        while (true)
+          {
+            std::function<void()> job;[cite: 6]
+
+            {
+              std::unique_lock<std::mutex> lock(queue_mutex);[cite: 6]
+
+              // Sleep until work is available OR the pool is shutting down
+              queue_condition.wait(lock, [this]() {
+                return !jobs.empty() || stop_thread_pool;[cite: 6]
+              });
+
+              // Shutdown condition: Exit thread loop when pool stops and no jobs remain
+              if (stop_thread_pool && jobs.empty())
+                {
+                  if (active_jobs == 0)
+                    work_done_condition.notify_all();[cite: 6]
+                  return;[cite: 6]
+                }
+
+              // Retrieve task from queue
+              job = std::move(jobs.front());[cite: 6]
+              jobs.pop();[cite: 6]
+              active_jobs++;[cite: 6]
+            } // Lock released HERE before job execution![cite: 6]
+
+            // Execute job outside critical section to allow parallel queue access
+            job();[cite: 6]
+
+            {
+              std::unique_lock<std::mutex> lock(queue_mutex);[cite: 6]
+              active_jobs--;[cite: 6]
+
+              // Signal wait_for_all() if all tasks finished and all workers are idle
+              if (jobs.empty() && active_jobs == 0)
+                work_done_condition.notify_all();[cite: 6]
+            }
+          }
+      });
+    }
+}
+
+```
+
+#### Key Implementation Details:
+
+1. **Spurious Wakeup Protection:** `queue_condition.wait(lock, predicate)` accepts a lambda predicate (`[!this]() { return !jobs.empty() || stop_thread_pool; }`). This ensures that if the OS wakes up a thread without an explicit notification, the thread re-checks the condition and goes back to sleep.
+
+
+2. **Critical Section Minimization:** The lock (`queue_mutex`) is released **before** calling `job()`. Executing arbitrary user code inside a critical section would serialize execution, destroying parallelism across worker threads.
+
+
+3. **Move Semantics:** Standard containers and `std::function` objects are moved (`std::move`) rather than copied to eliminate unnecessary memory allocation overhead.
+
+
+
+---
+
+### B. Task Submission (`enqueue`)
+
+Pushes user-defined computational work into the queue and alerts sleeping threads.
+
+```cpp
+inline void ThreadPool::enqueue(std::function<void()> job)
+{
+  {
+    std::unique_lock<std::mutex> lock(queue_mutex);[cite: 6]
+    jobs.push(std::move(job));[cite: 6]
+  }
+  queue_condition.notify_one(); // Unblocks a single sleeping worker[cite: 6]
+}
+
+```
+
+* **`notify_one()` vs. `notify_all()`:** Because only a single job was added, calling `notify_one()` wakes up exactly one worker thread. Calling `notify_all()` would trigger a **thundering herd problem**, waking up all workers only for all but one to immediately go back to sleep.
+
+
+
+---
+
+### C. Synchronization Barrier (`wait_for_all`)
+
+Blocks caller execution until all enqueued tasks are completed and all workers return to an idle state.
+
+```cpp
+inline void ThreadPool::wait_for_all()
+{
+  std::unique_lock<std::mutex> lock(queue_mutex);[cite: 6]
+
+  work_done_condition.wait(lock, [this]() {
+    return jobs.empty() && active_jobs == 0;[cite: 6]
+  });
+}
+
+```
+
+* **Dual Condition Requirement:** Reaching `jobs.empty()` alone is insufficient because jobs currently running in parallel threads are no longer in the queue. The barrier requires **both** `jobs.empty() == true` AND `active_jobs == 0` to confirm full completion.
+
+
+
+---
+
+### D. Graceful Shutdown & Destructor
+
+Ensures RAII compliance by terminating worker loops and joining native threads safely.
+
+```cpp
+inline ThreadPool::~ThreadPool() noexcept
+{
+  {
+    std::unique_lock<std::mutex> lock(queue_mutex);[cite: 6]
+    stop_thread_pool = true;[cite: 6]
+  }
+  queue_condition.notify_all(); // Wake up ALL sleeping workers so they check stop_thread_pool[cite: 6]
+
+  for (std::thread &worker : workers)
+    if (worker.joinable())
+      worker.join(); // Block until worker thread exits loop and terminates[cite: 6]
+}
+
+```
+
+---
+
+## 5. Summary Table for Oral Exam Defense
+
+| Question / Concept | Defense Explanation |
+| --- | --- |
+| **Why use a Thread Pool over raw `std::thread`s?** | Eliminates thread creation/destruction OS kernel overhead and context switching costs by creating $N$ persistent workers once and re-using them across tasks.
+
+ |
+| **Why release `queue_mutex` before calling `job()`?** | Holding the mutex during task execution locks the queue, forcing all other worker threads to block sequentially and rendering the system single-threaded.
+
+ |
+| **Why is a predicate necessary in `cv.wait()`?** | Guards against **spurious wakeups** (OS waking a thread without a signal) and race conditions where another thread steals the job first.
+
+ |
+| **Difference between `queue_condition` and `work_done_condition`?** | `queue_condition` signals **workers** that tasks are available; `work_done_condition` signals **external callers** (`wait_for_all`) that all tasks are finished.
+
+ |
+| **What happens if a thread pool is destroyed while tasks are active?** | The destructor sets `stop_thread_pool = true`, wakes sleeping threads, allows running tasks to complete, and joins all workers gracefully (RAII).
+
+ |
