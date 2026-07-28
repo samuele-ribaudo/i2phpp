@@ -672,18 +672,8 @@ inline ThreadPool::~ThreadPool() noexcept
 
 | Question / Concept | Defense Explanation |
 | --- | --- |
-| **Why use a Thread Pool over raw `std::thread`s?** | Eliminates thread creation/destruction OS kernel overhead and context switching costs by creating $N$ persistent workers once and re-using them across tasks.
-
- |
-| **Why release `queue_mutex` before calling `job()`?** | Holding the mutex during task execution locks the queue, forcing all other worker threads to block sequentially and rendering the system single-threaded.
-
- |
-| **Why is a predicate necessary in `cv.wait()`?** | Guards against **spurious wakeups** (OS waking a thread without a signal) and race conditions where another thread steals the job first.
-
- |
-| **Difference between `queue_condition` and `work_done_condition`?** | `queue_condition` signals **workers** that tasks are available; `work_done_condition` signals **external callers** (`wait_for_all`) that all tasks are finished.
-
- |
-| **What happens if a thread pool is destroyed while tasks are active?** | The destructor sets `stop_thread_pool = true`, wakes sleeping threads, allows running tasks to complete, and joins all workers gracefully (RAII).
-
- |
+| **Why use a Thread Pool over raw `std::thread`s?** | Eliminates thread creation/destruction OS kernel overhead and context switching costs by creating $N$ persistent workers once and re-using them across tasks.|
+| **Why release `queue_mutex` before calling `job()`?** | Holding the mutex during task execution locks the queue, forcing all other worker threads to block sequentially and rendering the system single-threaded.|
+| **Why is a predicate necessary in `cv.wait()`?** | Guards against **spurious wakeups** (OS waking a thread without a signal) and race conditions where another thread steals the job first.|
+| **Difference between `queue_condition` and `work_done_condition`?** | `queue_condition` signals **workers** that tasks are available; `work_done_condition` signals **external callers** (`wait_for_all`) that all tasks are finished.|
+| **What happens if a thread pool is destroyed while tasks are active?** | The destructor sets `stop_thread_pool = true`, wakes sleeping threads, allows running tasks to complete, and joins all workers gracefully (RAII).|
