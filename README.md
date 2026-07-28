@@ -505,27 +505,13 @@ A **Thread Pool** resolves this overhead by instantiating a fixed set of $N$ per
 
 | Member Variable | Data Type | Theoretical & Functional Role |
 | --- | --- | --- |
-| `workers` | `std::vector<std::thread>` | Container holding the persistent worker threads created at pool instantiation.
-
- |
-| `jobs` | `std::queue<std::function<void()>>` | Thread-safe FIFO task queue storing pending computational jobs.
-
- |
-| `queue_mutex` | `std::mutex` | Mutual exclusion lock protecting concurrent reads/writes to `jobs`, `active_jobs`, and flags.
-
- |
-| `queue_condition` | `std::condition_variable` | Signals sleeping worker threads when a new task is enqueued or when shutdown begins.
-
- |
-| `work_done_condition` | `std::condition_variable` | Signals calling threads blocked in `wait_for_all()` when all enqueued tasks complete.
-
- |
-| `active_jobs` | `std::size_t` | Atomic/synchronized counter tracking the number of threads currently executing a job.
-
- |
-| `stop_thread_pool` | `bool` | Boolean shutdown flag instructing worker threads to terminate their event loops.
-
- |
+| `workers` | `std::vector<std::thread>` | Container holding the persistent worker threads created at pool instantiation.|
+| `jobs` | `std::queue<std::function<void()>>` | Thread-safe FIFO task queue storing pending computational jobs.|
+| `queue_mutex` | `std::mutex` | Mutual exclusion lock protecting concurrent reads/writes to `jobs`, `active_jobs`, and flags.|
+| `queue_condition` | `std::condition_variable` | Signals sleeping worker threads when a new task is enqueued or when shutdown begins.|
+| `work_done_condition` | `std::condition_variable` | Signals calling threads blocked in `wait_for_all()` when all enqueued tasks complete.|
+| `active_jobs` | `std::size_t` | Atomic/synchronized counter tracking the number of threads currently executing a job.|
+| `stop_thread_pool` | `bool` | Boolean shutdown flag instructing worker threads to terminate their event loops.|
 
 ---
 
