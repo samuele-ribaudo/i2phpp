@@ -836,17 +836,6 @@ for (int i = 0; i < 8; ++i) {
 
 ```
 
-
-
-### 4. Manual Worksharing Math
-
-When not using `#pragma omp for`, work can be manually divided using thread IDs:
-
-
-$$\text{start\_index} = \frac{\text{thread\_id} \cdot n}{\text{n\_threads}}$$
-
-$$\text{end\_index} = \begin{cases} n & \text{if } \text{thread\_id} = \text{n\_threads} - 1 \\ \frac{(\text{thread\_id} + 1) \cdot n}{\text{n\_threads}} & \text{otherwise} \end{cases}$$
-
 ---
 
 ## Key Oral Exam & Worksheet Takeaways
