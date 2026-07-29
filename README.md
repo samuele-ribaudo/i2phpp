@@ -857,3 +857,330 @@ for (int i = 0; i < 8; ++i) {
 > 
 > 
 >
+
+---
+
+# WORKSHEET 2 BREAKDOWN
+
+## 1. Task 1: Linear Algebra Vector Parallelization (`LaVector<number>`)
+
+### Implementation Pattern: OpenMP Worksharing & Scoping
+
+In `la_vector.cpp`, vector operators (`operator+`, `operator+=`, `operator-`, `operator-=`, `operator*`, `operator*=`, `operator/`, `operator/=`, `schur_product`) and vector norms are parallelized using the `#pragma omp parallel for` directive.
+
+To adhere to OpenMP best practices and eliminate subtle scoping bugs, every parallel construct explicitly enforces `default(none)` and explicitly declares all variables as either `shared` or via `reduction`:
+
+```cpp
+// Example: Element-wise addition (operator+)
+#pragma omp parallel for default(none) shared(self, vec, result, n)
+for (std::size_t i = 0; i < n; ++i)
+    result[i] = self[i] + vec[i];
+
+```
+
+---
+
+### Reductions & Norm Computations
+
+For scalar outputs derived from vector traversals (`dot_product`, `l2_norm_squared`, `norm_l1`, and `norm_linf`), OpenMP reduction clauses are utilized to prevent data races without using expensive critical sections or explicit locks:
+
+* **Dot Product & $L_2$ Norm Squared**:
+```cpp
+#pragma omp parallel for default(none) shared(self, other, n) reduction(+ : result)
+for (std::size_t i = 0; i < n; ++i)
+    result += self[i] * other[i];
+
+```
+
+
+* **$L_1$ Norm**:
+```cpp
+#pragma omp parallel for default(none) shared(self, n) reduction(+ : sum)
+for (std::size_t i = 0; i < n; ++i)
+    sum += std::abs(self[i]);
+
+```
+
+
+* **$L_\infty$ Norm**:
+```cpp
+#pragma omp parallel for default(none) shared(self, n) reduction(max : max_abs)
+for (std::size_t i = 0; i < n; ++i) {
+    const number a = std::abs(self[i]);
+    if (a > max_abs) max_abs = a;
+}
+
+```
+
+
+
+---
+
+### Oral Exam Defense Questions (Task 1)
+
+> #### Q1: Why is `schedule(static)` implicitly optimal for `LaVector` operations?
+> 
+> 
+> * **Reason**: Each loop iteration performs an identical $O(1)$ arithmetic operation on contiguous memory addresses. Workload distribution is perfectly uniform across threads, making dynamic runtime scheduling unnecessary and wasteful due to queue access overhead.
+> 
+> 
+> 
+> 
+
+> #### Q2: Why does increasing the thread count fail to yield linear speedup for large vector operations?
+> 
+> 
+> * **Memory Wall / Bandwidth Bottleneck**: Simple vector operations (e.g., $c_i = a_i + b_i$) have a very low **operational intensity** (ratio of FLOPs to bytes accessed). The CPU execution cores process data faster than main memory (DRAM) can supply it, causing thread execution time to be bounded by memory bus bandwidth rather than raw compute power.
+> 
+> 
+> 
+> 
+
+---
+
+## 2. Task 2: Linear Algebra Matrix Parallelization (`LaMatrix<number>`)
+
+### A. Element-Wise Operations & Loop Collapsing (`collapse(2)`)
+
+For 2D array structures stored as `std::vector<std::vector<number>>`, element-wise additions, subtractions, and scalar operations iterate across both rows and columns. The `collapse(2)` clause merges the two nested loops into a single multi-dimensional iteration space:
+
+```cpp
+#pragma omp parallel for default(none) shared(self, mat, result, num_rows, num_cols) collapse(2)
+for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t col_idx = 0; col_idx < num_cols; ++col_idx)
+        result[row_idx, col_idx] = self[row_idx, col_idx] + mat[row_idx, col_idx];
+
+```
+
+#### Why use `collapse(2)` here?
+
+* **Larger Iteration Space**: If a matrix has a small row count (e.g., $4 \times 10000$), parallelizing only the outer loop leaves threads underutilized. Collapsing combines $M \times N$ iterations into a single flat work pool, drastically improving load distribution across threads.
+
+
+
+---
+
+### B. Matrix-Matrix Multiplication ($C = A \cdot B$)
+
+Matrix-matrix multiplication uses an optimized $i \to k \to j$ loop ordering (`row_idx` $\to$ `idx` $\to$ `col_idx`) to ensure linear, cache-friendly memory accesses along the contiguous rows of matrix $B$:
+
+```cpp
+#pragma omp parallel for default(none) shared(self, mat, result, num_rows, num_cols, mat_num_cols)
+for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t idx = 0; idx < num_cols; ++idx)
+        for (std::size_t col_idx = 0; col_idx < mat_num_cols; ++col_idx)
+            result[row_idx, col_idx] += self[row_idx, idx] * mat[idx, col_idx];
+
+```
+
+#### Why parallelize ONLY the outermost loop ($i$)?
+
+1. **Thread Safety**: Each thread handles a distinct subset of rows in matrix $C$ (`row_idx`). Since write targets `result[row_idx, col_idx]` are unique per outer iteration, no data races occur on matrix $C$, eliminating the need for `critical` or `atomic` constructs.
+
+
+2. **Minimal Thread Management Overhead**: Forking and synchronizing threads once at the outer loop level avoids repeating parallel region overhead $M$ times.
+
+
+
+---
+
+### C. Matrix Trace & Matrix-Vector Product
+
+* **`trace()`**: Operates purely along the main diagonal ($A_{i, i}$) using a single loop parallelized via `reduction(+ : tr)`.
+
+
+* **Matrix-Vector Product ($y = A \cdot x$)**: Parallelized over matrix rows (`row_idx`). Each thread computes the complete inner product for row `row_idx` into `result[row_idx]`, guaranteeing thread-safe writes.
+
+
+
+---
+
+### Oral Exam Defense Questions (Task 2)
+
+> #### Q1: Why shouldn't you apply `collapse(3)` to matrix-matrix multiplication?
+> 
+> 
+> * **Reason**: Collapsing the inner $k$ or $j$ loops causes multiple threads to concurrently attempt updates to the same output cell $C_{i, j}$, introducing severe data races that require explicit mutex locking (`critical`) or atomic operations, drastically ruining performance.
+> 
+> 
+> 
+> 
+
+> #### Q2: What is the difference between CPU Time and Wall-Clock Time in parallel benchmarks?
+> 
+> 
+> * **Wall-Clock Time**: Real elapsed time from start to end of execution.
+> 
+> 
+> * **CPU Time**: Total active execution time accumulated across all CPU cores. In an ideal $N$-thread parallel region running for 1 second of wall-clock time, CPU time equals $N$ seconds.
+> 
+> 
+> 
+> 
+
+---
+
+## 3. Task 3: Matrix-Free Heat Equation Solver (`HeatOperator`)
+
+In the matrix-free explicit Euler implementation, the state update $u_i^{(n+1)} = u_i^{(n)} + \Delta t \cdot \left(\text{stencil}(i, u^{(n)}) + Q_i\right)$ is computed directly on degrees of freedom (DoFs) without forming or storing a global matrix:
+
+```cpp
+#pragma omp parallel for default(none) shared(heat_data, dof_handler, current_time_increment, old_time, old_solution, current_solution)
+for (std::size_t i = 0; i < heat_data.grid.n_global_dofs; ++i) {
+    if (!dof_handler.at_boundary(i)) {
+        current_solution[i] = old_solution[i] + current_time_increment * 
+            (matrix_free_stencil(i, old_solution) + source_term(old_time, i));
+    }
+}
+
+```
+
+Similarly, the source term evaluation `source_term_vector` is parallelized across all global DoF indices:
+
+```cpp
+#pragma omp parallel for default(none) shared(heat_data, current_time, source)
+for (std::size_t i = 0; i < heat_data.grid.n_global_dofs; ++i)
+    source[i] = source_term(current_time, i);
+
+```
+
+---
+
+### Oral Exam Defense Questions (Task 3)
+
+> #### Q1: Why can a matrix-free solver outperform a matrix-based solver even though it recomputes finite difference stencils on every time step?
+> 
+> 
+> * **Reason**: Matrix-based updates require fetching giant sparse matrix structures from main memory on every time step, starving CPU execution units due to limited memory bandwidth. The matrix-free approach trades arithmetic operations (which modern CPUs execute rapidly in registers) for memory transfers, significantly reducing memory bus traffic and overcoming the Memory Wall bottleneck.
+> 
+> 
+> 
+> 
+
+---
+
+## 4. Task 4: System Matrix Initialization (`setup_finite_difference_heat_equation_system_matrix`)
+
+The assembly loop constructs the discrete Laplace operator matrix row-by-row:
+
+```cpp
+#pragma omp parallel for default(none) shared(heat_data, dof_handler, system_matrix, offset) schedule(static)
+for (std::size_t row_idx = 0; row_idx < heat_data.grid.n_global_dofs; ++row_idx) {
+    if (!dof_handler.at_boundary(row_idx)) {
+        // Compute stencil coefficients and assign entries in system_matrix[row_idx, ...]
+    }
+}
+
+```
+
+---
+
+### Oral Exam Defense Questions (Task 4)
+
+> #### Q1: Is explicit synchronization (`#pragma omp critical`) required during system matrix assembly?
+> 
+> 
+> * **No**: Each loop iteration `row_idx` writes exclusively to row `row_idx` of `system_matrix`. Because `LaMatrix` stores rows as independent allocations (`std::vector<std::vector<number>>`), threads access disjoint memory locations without write conflicts.
+> 
+> 
+> 
+> 
+
+> #### Q2: Which scheduling policy is best suited for system matrix assembly?
+> 
+> 
+> * **`schedule(static)`**: Assembly workload per interior DoF is fixed and identical. Static partitioning eliminates dynamic queue overhead and achieves optimal workload distribution.
+> 
+> 
+> 
+> 
+
+---
+
+## 5. Task 5: Implicit Time Stepping with the Jacobi Method
+
+### Mathematical Formulation
+
+The implicit Euler time-stepping scheme requires solving the linear system $A x = b$ at each step:
+
+
+$$A := I - \Delta t K, \quad x := u^{n+1}, \quad b := u^n + q^{n+1}$$
+
+The Jacobi iterative method updates the solution component-wise via:
+
+
+$$x_i^{(k+1)} = x_i^{(k)} + \frac{b_i - (A x^{(k)})_i}{A_{ii}}$$
+
+where the diagonal entry $A_{ii}$ is given by:
+
+
+$$A_{ii} = 1 - \Delta t K_{ii} = 1 + \Delta t \sum_{d=1}^{\text{dim}} \frac{2 \kappa_i}{\Delta x_d^2}$$
+
+---
+
+### Matrix-Free Jacobi Algorithm Structure
+
+```cpp
+// 1. Parallel RHS setup: b = u^n + q^(n+1)
+#pragma omp parallel for default(none) shared(heat_data, dof_handler, rhs, current_time)
+for (std::size_t i = 0; i < heat_data.grid.n_global_dofs; ++i)
+    if (!dof_handler.at_boundary(i))
+        rhs[i] += source_term(current_time, i);
+
+// 2. Iterative Jacobi Loop (max 1000 iterations)
+for (std::size_t iter = 0; iter < 1000; ++iter) {
+    // 2a. Parallel Residual Calculation: r_i = (A * x_old)_i - b_i
+    #pragma omp parallel for default(none) shared(heat_data, dof_handler, current_time_increment, x_old, rhs, residual_vec)
+    for (std::size_t i = 0; i < heat_data.grid.n_global_dofs; ++i) {
+        if (!dof_handler.at_boundary(i)) {
+            number A_x_i = x_old[i] - current_time_increment * matrix_free_stencil(i, x_old);
+            residual_vec[i] = A_x_i - rhs[i];
+        } else {
+            residual_vec[i] = 0.0;
+        }
+    }
+
+    // 2b. Convergence Check: relative residual norm ||r||_2 / ||x_old||_2
+    number r = residual_vec.norm_l2() / x_old.norm_l2();
+    if (iter > 0 && r < heat_data.iterative_solver_tolerance)
+        break;
+
+    // 2c. Parallel Jacobi Point Update
+    #pragma omp parallel for default(none) shared(heat_data, dof_handler, current_time, current_time_increment, x_old, x_new, rhs)
+    for (std::size_t i = 0; i < heat_data.grid.n_global_dofs; ++i) {
+        if (!dof_handler.at_boundary(i)) {
+            x_new[i] = jacobi_update(i, current_time, current_time_increment, x_old, rhs);
+        }
+    }
+
+    // 2d. Double Buffering Swap
+    x_old = x_new;
+}
+
+```
+
+---
+
+### Oral Exam Defense Questions (Task 5)
+
+> #### Q1: Why is double buffering (`x_old` and `x_new`) mandatory in the parallel Jacobi method?
+> 
+> 
+> * **Reason**: The Jacobi method requires that all updates in iteration $(k+1)$ depend strictly on values from iteration $(k)$. If updates were written in-place to `x_old`, threads would read partially updated values from neighboring indices, converting the algorithm into a non-deterministic parallel Gauss-Seidel scheme and causing race conditions.
+> 
+> 
+> 
+> 
+
+---
+
+## 6. Summary Table for Oral Exam Defense
+
+| Operation / Construct | Implementation Pattern | Key Reason / Strategy |
+| --- | --- | --- |
+| **`LaVector` Norms & Dot** | `#pragma omp parallel for reduction(...)`<br> | Prevents data races on global scalar accumulators.|
+| **Matrix Element-Wise** | `#pragma omp parallel for collapse(2)`<br> | Merges row/col loops for maximum thread work distribution.|
+| **Matrix Multiplication** | Outer loop parallelized ($i$), order $i \to k \to j$<br> | Ensures contiguous memory access on $B$ without output races.|
+| **Matrix-Free Solver** | Recomputes stencil dynamically in parallel loop| Mitigates memory bandwidth limits (Memory Wall).|
+| **Matrix Setup** | Parallel over rows, `schedule(static)`<br> | Thread-safe independent row writes; equal workload per DoF.|
+| **Jacobi Solver** | Separate parallel steps + double buffering| Guarantees algorithmic correctness without inter-thread dependencies.|
