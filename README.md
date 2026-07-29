@@ -1188,7 +1188,7 @@ for (std::size_t iter = 0; iter < 1000; ++iter) {
 
 ---
 
-## MPI
+# MPI - Message Passing Interface
 
 ### 1. Distributed Memory Architecture & Process Model
 
