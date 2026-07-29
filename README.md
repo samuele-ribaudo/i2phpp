@@ -1184,3 +1184,236 @@ for (std::size_t iter = 0; iter < 1000; ++iter) {
 | **Matrix-Free Solver** | Recomputes stencil dynamically in parallel loop| Mitigates memory bandwidth limits (Memory Wall).|
 | **Matrix Setup** | Parallel over rows, `schedule(static)`<br> | Thread-safe independent row writes; equal workload per DoF.|
 | **Jacobi Solver** | Separate parallel steps + double buffering| Guarantees algorithmic correctness without inter-thread dependencies.|
+
+
+---
+
+## MPI
+
+### 1. Distributed Memory Architecture & Process Model
+
+* **Distributed Memory Systems**: Each process runs on its own node/processor and possesses its own private memory address space. Processes cannot directly read or write to another process's memory; data must be exchanged explicitly across a network interconnect (e.g., InfiniBand).
+
+
+* **MPI vs. OpenMP**: OpenMP uses a shared-memory model with a single process spawning multiple threads sharing the same address space. MPI launches $N$ separate, fully isolated processes across nodes, each running its own copy of the executable.
+
+
+* **Environment & Communicators**:
+* An MPI environment must be initialized before any MPI function calls and finalized upon exit.
+
+
+* **Communicator**: A group of processes that can communicate with each other. `MPI_COMM_WORLD` is the default communicator encompassing all launched processes.
+
+
+* **Rank**: The unique integer identifier assigned to each process inside a communicator (from $0$ to $\text{size}-1$).
+
+
+
+
+
+---
+
+### 2. Point-to-Point Communication & Underlying Protocols
+
+Point-to-point transfers happen between a specific sender rank and receiver rank using matched parameters (Communicator, Tag, Source/Destination).
+
+#### Under-the-Hood Transfer Protocols (Critical Oral Exam Topic)
+
+When `MPI_Send` is invoked, MPI dynamically chooses between two primary protocols based on message size:
+
+* **Eager Protocol (Small / Medium Messages)**:
+
+
+* Data is sent immediately to the receiver's MPI System Buffer without waiting for the receiver to post a matching `MPI_Recv`.
+
+
+* **Pros**: Sender returns quickly, minimizing CPU waiting time.
+
+
+* **Cons**: Requires extra memory overhead and buffer copies on the receiving system.
+
+
+
+
+* **Rendezvous Protocol (Large Messages)**:
+
+
+* A light-weight handshake takes place first: sender asks receiver if it is ready. Once receiver posts a matching `MPI_Recv`, it acknowledges the sender, and data is transferred **directly** from sender memory to receiver program memory.
+
+
+* **Pros**: Eliminates double-buffering and system buffer memory overhead.
+
+
+* **Cons**: Requires additional handshake round-trips; sender blocks until the complete transfer finishes.
+
+
+
+
+
+#### Message Queues Inside MPI
+
+* **Receive Queue**: Holds requests posted by `MPI_Recv` that have not yet matched incoming data.
+
+
+* **Unexpected Message Queue (UMQ)**: Stores incoming data packets (via Eager protocol) that arrived before a matching `MPI_Recv` was called.
+
+
+
+#### Deadlocks
+
+Deadlocks occur when processes wait indefinitely for each other to complete synchronous communication calls. For example, if Rank 0 and Rank 1 both call blocking `MPI_Recv` first, neither can send data.
+
+---
+
+### 3. Non-Blocking Communication
+
+* **Purpose**: Allows communication to happen in the background while the CPU performs independent computation, enabling **computation-communication overlap** and avoiding deadlocks.
+
+
+* **Request Handles (`MPI_Request`)**: Non-blocking functions (`MPI_Isend`, `MPI_Irecv`) return immediately and use an `MPI_Request` handle to track progress.
+
+
+* **Synchronization / Completion**:
+* `MPI_Wait`: Blocks execution until the non-blocking operation associated with the request completes.
+
+
+* `MPI_Test`: Non-blocking query that polls whether the operation is finished (returns a boolean flag).
+
+
+
+
+
+---
+
+### 4. MPI Collective Operations
+
+Collective operations involve **all processes** in a communicator. If one process omits a collective call, the program will hang indefinitely.
+
+| Collective Function | Operation Description |
+| --- | --- |
+| `MPI_Barrier` | Blocks processes until all processes in the communicator reach this point.|
+| `MPI_Bcast` | Broadcasts data from a single root rank to all other ranks.|
+| `MPI_Reduce` | Combines data from all ranks using an operation (e.g., `MPI_SUM`, `MPI_MIN`, `MPI_MAX`) and stores the result on the root rank.|
+| `MPI_Allreduce` | Performs reduction and distributes the final result to **all** ranks.|
+| `MPI_Gather` / `MPI_Gatherv` | Collects distinct data blocks from all ranks and concatenates them on the root rank.|
+| `MPI_Scatter` / `MPI_Scatterv` | Splits a data buffer on the root rank into equal (or variable) chunks and distributes them across ranks.|
+| `MPI_Alltoall` | Performs an all-to-all personalized exchange where every rank sends distinct data to every rank.|
+
+---
+
+## MPI Live Coding Syntax Reference
+
+Below is a reference of the core C++ MPI syntax derived from the live coding sessions:
+
+### Environment Setup & Basic Queries
+
+```cpp
+#include <mpi.h> // Required header[cite: 1]
+
+int main(int argc, char** argv) {
+    // 1. Initialize MPI environment[cite: 1]
+    MPI_Init(&argc, &argv);
+
+    int rank, size;
+    // 2. Get current process ID (rank)[cite: 1]
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    // 3. Get total process count[cite: 1]
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // 4. Abort MPI execution on error[cite: 1]
+    if (size < 2) {
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    // 5. Finalize MPI environment (no MPI calls allowed after this)[cite: 1]
+    MPI_Finalize();
+    return 0;
+}
+
+```
+
+### Point-to-Point Syntax
+
+#### Blocking Point-to-Point
+
+```cpp
+int data = 100;
+int tag = 0;
+
+// Sender (e.g., Rank 0)
+MPI_Send(&data, 1, MPI_INT, 1 /* dest */, tag, MPI_COMM_WORLD);[cite: 1]
+
+// Receiver (e.g., Rank 1)
+MPI_Recv(&data, 1, MPI_INT, 0 /* src */, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);[cite: 1]
+
+```
+
+#### Non-Blocking Point-to-Point & Completion
+
+```cpp
+MPI_Request request;
+MPI_Status status;
+int data = 747;
+
+// Non-blocking Send[cite: 1]
+MPI_Isend(&data, 1, MPI_INT, 1 /* dest */, tag, MPI_COMM_WORLD, &request);
+
+// Non-blocking Receive[cite: 1]
+MPI_Irecv(&data, 1, MPI_INT, 0 /* src */, tag, MPI_COMM_WORLD, &request);
+
+// Polling for completion (Non-blocking)[cite: 1]
+int flag = 0;
+MPI_Test(&request, &flag, &status);[cite: 1]
+if (flag) {
+    // Communication complete[cite: 1]
+}
+
+// Explicit Wait (Blocking until complete)[cite: 1]
+MPI_Wait(&request, &status);[cite: 1]
+
+```
+
+---
+
+## Key Takeaways for Oral Exam & Worksheets
+
+### Oral Exam Preparation Points
+
+1. **Explain Eager vs. Rendezvous Protocol**: Be prepared to explain how buffer sizes dictate protocol choice, what memory trade-offs occur, and why Rendezvous avoids memory overhead at the expense of handshake latency.
+
+
+2. **Explain the UMQ vs. Receive Queue**: Explain what happens if `MPI_Send` arrives before `MPI_Recv` is called (stored in Unexpected Message Queue) versus when `MPI_Recv` is posted first (stored in Receive Queue).
+
+
+3. **Deadlock Identification**: Identify deadlocks in code examples involving synchronous blocking communications.
+
+
+4. **Shared vs. Distributed Memory**: Contrast threads (shared heap, separate stacks) with processes (isolated address space, explicit message passing).
+
+
+5. **Collective Synchronization Requirements**: Explain why all processes must call a collective operation and the performance implications of barrier synchronization.
+
+
+
+### Key Concepts for Worksheets & Domain Decomposition
+
+* **Ghost Cells / Halo Exchange**: In parallel finite difference or grid simulations (such as the heat equation), each rank owns a portion of the domain. Boundaries between ranks require exchanging boundary values ("ghost cells") via point-to-point communication.
+
+
+* **Hiding Communication Latency**:
+1. Post non-blocking receives (`MPI_Irecv`) and sends (`MPI_Isend`) for ghost layer data.
+
+
+2. Compute updates for the **inner domain** (data that doesn't depend on ghost cells) while communication proceeds in the background.
+
+
+3. Call `MPI_Wait` / `MPI_Waitall` to ensure ghost cells have arrived.
+
+
+4. Compute updates for the **outer domain boundaries** using the freshly received ghost values.
+
+
+
+
+* **Buffer Safety**: Never overwrite or re-use a memory buffer passed to `MPI_Isend` or `MPI_Irecv` until `MPI_Wait` or `MPI_Test` confirms the request is complete.
