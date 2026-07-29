@@ -1417,3 +1417,242 @@ MPI_Wait(&request, &status);[cite: 1]
 
 
 * **Buffer Safety**: Never overwrite or re-use a memory buffer passed to `MPI_Isend` or `MPI_Irecv` until `MPI_Wait` or `MPI_Test` confirms the request is complete.
+
+
+
+
+
+# WORKSHEET 3
+
+Here is a comprehensive, step-by-step walkthrough of **Worksheet 3 (MPI Parallel Heat Solver)** based on your actual source code and submitted report.
+
+This walkthrough is specifically tailored for your **oral exam**, highlighting the architectural decisions, theoretical reasoning, MPI mechanisms, and potential exam questions.
+
+---
+
+# Strategic Overview
+
+### Core Objective
+
+Transform a serial, 1D/2D/3D matrix-free Heat Equation solver into a fully distributed parallel solver using **MPI domain decomposition** (slicing the spatial domain along the highest spatial dimension).
+
+### Key Abstractions
+
+1. **`Partitioner`**: The communication backbone. Determines communication topology (who needs data from whom) and manages asynchronous ghost cell exchanges.
+2. **`ParallelDistributedVector`**: Linear algebra vector that holds `local_elements` (locally owned elements followed by read-only ghost elements).
+3. **`DoFHandler`**: Maps physical/cartesian grid indices to global 1D array indices and handles domain splitting (including process oversubscription).
+4. **`HeatOperator`**: Implements explicit and implicit (Jacobi) time-stepping schemes using matrix-free stencils.
+
+---
+
+# Task-by-Task Walkthrough & Solution Analysis
+
+## Task 1: Distributed Vector & Linear Algebra Operations
+
+**File:** `parallel_distributed_vector.cpp`
+
+### 1. Vector Memory Layout
+
+* Each process holds a continuous array `local_elements` containing:
+
+$$\text{local\_elements} = [\underbrace{\text{Locally Owned Entries}}_{0 \dots N_{\text{owned}}-1} \,\vert{}\, \underbrace{\text{Ghost Entries}}_{N_{\text{owned}} \dots N_{\text{owned}}+N_{\text{ghost}}-1}]$$
+
+
+
+### 2. Local vs. Global Vector Operations
+
+* **Local Operations (`+=`, `-=`, `*=`, `+`, `-`)**:
+* Carried out entirely locally across all `local_elements` (owned + ghost).
+* **No MPI communication is needed.**
+* *Prerequisite check*: `assert_compatibility()` verifies that both vectors share the exact same process distribution and ghost layout.
+
+
+* **Global Operations (`dot_product`, `l2_norm`)**:
+* **Critical Detail**: Sum **ONLY** the locally owned entries ($0 \dots N_{\text{owned}}-1$).
+* *Why?* Ghost elements are copies of data owned by neighboring processes. Summing ghost elements would **double-count** values, producing an incorrect dot product.
+* *MPI Call*: `MPI_Allreduce(&local_dot, &global_dot, 1, MPI_DOUBLE, MPI_SUM, communicator);`
+* `l2_norm()` simply computes $\sqrt{\text{dot\_product}(*\text{this})}$.
+
+
+
+---
+
+## Task 2: The MPI Partitioner & Ghost Exchange
+
+**Files:** `partitioner.cpp`, `partitioner.hpp`
+
+The partitioner solves the problem of establishing **which rank needs to send/receive which indices to/from whom**, without central master coordination.
+
+### 1. Determining Communication Pattern (`determine_communication_pattern`)
+
+```
+   Rank 0 Requests Ghosts          Rank 1 Requests Ghosts          Rank 2 Requests Ghosts
+             │                               │                               │
+             └───────────────────────┬───────┴───────────────────────────────┘
+                                     ▼
+                      Step 1: MPI_Allgather & MPI_Allgatherv
+                                     │
+                                     ▼
+                      Global Array of All Requested Ghosts
+                                     │
+                                     ▼
+                   Step 2: Local Ownership Check (Filtering)
+                                     │
+                                     ▼
+                  Fills export_targets_and_indices (Who I Send To)
+                                     │
+                                     ▼
+                   Step 3: Transpose via MPI_Alltoall
+                                     │
+                                     ▼
+                 Fills import_targets_and_indices (Who I Recv From)
+
+```
+
+* **Step 1: Ghost Request Phase (Global Gathering)**
+1. Each rank queries its local ghost count: `my_ghost_count = ghost_indices.size()`.
+2. `MPI_Allgather` distributes the ghost counts to all processes (`ghost_counts`).
+3. Displacements (`ghost_displs`) are computed.
+4. `MPI_Allgatherv` gathers all requested ghost indices from all processes into a global flattened array `all_ghosts`.
+
+
+* **Step 2: Ownership Check Phase**
+1. Each rank loops through the collected ghost requests of every other rank $r$.
+2. If the current rank owns an index requested by rank $r$ (`locally_owned_indices.is_element(index)`), it adds that index to a temporary set.
+3. Populates `export_targets_and_indices`: pairs of `(rank_r, index_set)`.
+
+
+* **Step 3: Communication Matrix Transpose & Asynchronous Setup**
+* *Problem*: Rank A knows what it needs to *export* to Rank B, but Rank B does not yet know what it needs to *import* from Rank A.
+* *Solution*:
+1. Build `send_sizes` vector where `send_sizes[r]` is the number of indices to send to rank $r$.
+2. Execute `MPI_Alltoall(send_sizes, 1, ..., recv_sizes, 1, ...)` to transpose send counts into expected receive counts (`recv_sizes`).
+3. Allocate receive buffers and post **non-blocking receives** (`MPI_Irecv`).
+4. Post **non-blocking sends** (`MPI_Isend`) for outgoing data.
+5. Call `MPI_Waitall` to synchronize, then wrap raw received buffers into `import_targets_and_indices`.
+
+
+
+
+
+### 2. Exchanging Ghost Values (`export_to_ghosted_array_start` / `finish`)
+
+* Called during solver time-stepping to update ghost boundaries.
+* **Non-blocking strategy**:
+* Posts `MPI_Irecv` directly into the memory location of `ghost_array[local_ghost_idx]`.
+* Posts `MPI_Isend` directly from `locally_owned_array[local_owned_idx]`.
+
+
+* **Tag Disambiguation Trick**: The **global index** of the element is passed as the `tag` parameter in `MPI_Isend`/`MPI_Irecv`. This guarantees that arriving messages match the exact memory location regardless of network arrival order.
+* `export_to_ghosted_array_finish`: Calls `MPI_Waitall(request.size(), request.data(), ...)` to complete transfers.
+
+---
+
+## Task 3: Oversubscription & Sub-Communicator Splitting
+
+**File:** `dof_handler.cpp` (`initialize_dof_vector`)
+
+### The Oversubscription Problem
+
+If a user launches a simulation with $P$ processes, but the domain along the split direction (the last dimension $z$ in 3D or $y$ in 2D) has only $N_{\text{slices}} < P$ grid points, some processes will have 0 elements assigned. In standard partitioning, this leads to invalid index ranges and crashes.
+
+### The Solution: `MPI_Comm_split`
+
+1. Compute `max_slices = heat_data.grid.n_dofs[dim - 1]`.
+2. If `size > max_slices`:
+* Active ranks (`rank < max_slices`) set `color = 0`.
+* Idle ranks (`rank >= max_slices`) set `color = MPI_UNDEFINED`.
+
+
+3. Call `MPI_Comm_split(comm, color, rank, &new_comm)`.
+4. Ranks passing `MPI_UNDEFINED` receive `new_comm = MPI_COMM_NULL`.
+* Idle ranks construct an empty `ParallelDistributedVector(MPI_COMM_NULL)` and return early.
+
+
+5. Active ranks update `comm = new_comm`, re-query `comm_rank` and `comm_size`, and partition the grid normally.
+
+---
+
+## Task 4: Heat Operator Parallelization
+
+**File:** `heat_operator.cpp`
+
+### 1. Matrix-Free Stencil Computation (`matrix_free_stencil`)
+
+* Calculates discrete spatial derivatives without constructing global sparse matrices.
+* Lookups for center and neighbor values use `solution.global_element(global_index ± offset)`.
+* **`global_element()` Lookup Logic**:
+* If the global index is locally owned $\rightarrow$ returns direct reference from local memory.
+* If the global index is a ghost $\rightarrow$ resolves local offset in the ghost buffer.
+
+
+
+### 2. Explicit Euler Scheme (`advance_time_step`)
+
+```cpp
+current_solution.swap(old_solution);
+old_solution.update_ghost_values(); // Exchange halo cells across MPI ranks
+
+for (unsigned local_index = 0; local_index < current_solution.locally_owned_size(); ++local_index) {
+    unsigned global_index = partitioner.local_to_global(local_index);
+    if (!dof_handler.at_boundary(global_index)) {
+        current_solution.local_element(local_index) = old_solution.local_element(local_index) 
+            + dt * (matrix_free_stencil(global_index, old_solution) + source_term(...));
+    }
+}
+
+```
+
+### 3. Implicit Euler Scheme with Jacobi Iteration (`advance_time_step`)
+
+* Requires iterative updates until global residual norm $\le \text{tol}$.
+* **Inside the Jacobi Loop**:
+1. Synchronize iteration ghosts: `old_iter.update_ghost_values()`.
+2. Compute local Jacobi update: `jacobi_update(...)`.
+3. Synchronize new solution ghosts: `current_solution.update_ghost_values()`.
+4. Compute local sum of squared residuals (`loc_res * loc_res`).
+5. **Global Residual Reduction**:
+```cpp
+MPI_Allreduce(MPI_IN_PLACE, &res, 1, MPI_DOUBLE, MPI_SUM, comm);
+
+```
+
+
+* `MPI_IN_PLACE` is required because `&res` acts as both input buffer and output buffer on the calling rank.
+
+
+
+
+
+---
+
+# Oral Exam Preparation: Key Questions & Answers
+
+### Q1: Why can’t we sum all entries (including ghosts) during `dot_product`?
+
+> **Answer:** Ghost entries are read-only copies of elements owned by neighboring processes. If every process summed its entire array (owned + ghost), shared boundary values would be counted twice (or multiple times in higher dimensions). To maintain mathematical correctness, each process must sum **only** its `locally_owned_size()` elements before performing `MPI_Allreduce`.
+
+### Q2: Walk me through `determine_communication_pattern()`. How do ranks know who to receive ghost values from?
+
+> **Answer:**
+> 1. First, ranks exchange their ghost index requests globally using `MPI_Allgather` (for request counts) and `MPI_Allgatherv` (for flattened requested indices).
+> 2. Each rank checks all requested indices against its `locally_owned_indices` to build its `export_targets_and_indices` (who it must send data to).
+> 3. To find out who it will *receive* data from, each rank creates a `send_sizes` vector and transposes it across all ranks using `MPI_Alltoall`. The resulting `recv_sizes` vector tells each process exactly how many elements to expect from every other rank, allowing it to allocate receive buffers and post non-blocking `MPI_Irecv` calls.
+> 
+> 
+
+### Q3: Why did you use the global index as the message `tag` in non-blocking ghost updates?
+
+> **Answer:** Non-blocking communications (`MPI_Isend` / `MPI_Irecv`) can complete out of order depending on network routing. By setting the message tag equal to the element's unique `global_index`, MPI ensures that incoming messages match the exact destination memory address in `ghost_array`, preventing race conditions and buffer corruption.
+
+### Q4: What happens if a user runs a 3D simulation with 64 MPI processes, but there are only 16 grid slices along the $z$-axis?
+
+> **Answer:** The code handles process oversubscription gracefully in `dof_handler.cpp` using `MPI_Comm_split`. It compares process size against `max_slices` ($N_{z}$). The first 16 ranks pass `color = 0` to form an active sub-communicator, while ranks $\ge 16$ pass `color = MPI_UNDEFINED`. Ranks passing `MPI_UNDEFINED` receive `MPI_COMM_NULL`, initialize an empty vector, and sit idle safely without crashing the execution.
+
+### Q5: What is `MPI_IN_PLACE` in `MPI_Allreduce` and why did you use it?
+
+> **Answer:** Standard `MPI_Allreduce` expects separate send and receive memory buffers (`sendbuf` and `recvbuf`). When evaluating the implicit solver's residual, we accumulate the local squared residual directly into a scalar variable `res`. By passing `MPI_IN_PLACE` as the send buffer and `&res` as the receive buffer, we comply with the C/MPI standard and avoid memory overlap undefined behavior.
+
+### Q6: How does non-blocking ghost exchange allow computation-communication overlap?
+
+> **Answer:** By calling `export_to_ghosted_array_start()`, `MPI_Irecv` and `MPI_Isend` calls are posted to the background hardware queue, returning execution control immediately to the CPU. In a fully optimized solver, the CPU could compute stencil updates for **inner domain nodes** (which don't depend on ghost cells) while ghost communication transfers across the network. Calling `export_to_ghosted_array_finish()` (with `MPI_Waitall`) is only required before updating **boundary nodes** that depend on those ghost values.

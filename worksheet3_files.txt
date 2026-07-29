@@ -1,0 +1,1410 @@
+PARTITIONER.HPP
+
+#pragma once
+
+#include <i2phpp/util/index_set.hpp>
+#include <mpi.h>
+
+#include <ranges>
+#include <utility>
+#include <vector>
+
+namespace i2phpp
+{
+  /**
+   * @class Partitioner
+   * @brief Manages partitioning and communication of distributed data across
+   * MPI processes.
+   *
+   * This class provides functionality for managing locally owned and ghost
+   * indices, mapping between global and local indices, and exporting data from
+   * owned to ghosted regions. It also sets up the communication pattern for
+   * ghost exchange.
+   */
+  class Partitioner
+  {
+  public:
+    /**
+     * @brief Default constructor.
+     */
+    Partitioner() = default;
+
+    /**
+     * @brief Constructor with locally owned indices and an MPI communicator.
+     * Leaves the index set for ghost indices empty.
+     *
+     * @param local_owned_indices IndexSet of locally owned global indices.
+     * @param communicator The MPI communicator to use.
+     */
+    Partitioner(IndexSet local_owned_indices, MPI_Comm communicator);
+
+    /**
+     * @brief Constructor with locally owned and ghost indices and a
+     * corresponding MPI communicator.
+     *
+     * @param local_owned_indices IndexSet of locally owned global indices.
+     * @param ghost_indices IndexSet of ghosted global indices.
+     * @param communicator The MPI communicator to use.
+     */
+    Partitioner(IndexSet local_owned_indices,
+                IndexSet ghost_indices,
+                MPI_Comm communicator);
+
+    /**
+     * @brief Checks if a given global index is in the locally owned range.
+     *
+     * @param global_index The global index to query.
+     * @return True if the index is locally owned.
+     */
+    [[nodiscard]] bool
+    in_locally_owned_range(unsigned global_index) const;
+
+    /**
+     * @brief Checks if a global index is in the locally relevant range (owned
+     * or ghost).
+     *
+     * @param global_index The global index to query.
+     * @return True if the index is either locally owned or ghosted.
+     */
+    [[nodiscard]] bool
+    in_locally_relevant_range(unsigned global_index) const;
+
+    /**
+     * @brief Converts a given global index to a local index.
+     *
+     * @param global_index The global index.
+     * @return Corresponding local index.
+     */
+    [[nodiscard]] unsigned
+    global_to_local(unsigned global_index) const;
+
+    /**
+     * @brief Converts a given local index to a global index.
+     *
+     * @param local_index The local index.
+     * @return Corresponding global index.
+     */
+    [[nodiscard]] unsigned
+    local_to_global(unsigned local_index) const;
+
+    /**
+     * @brief Returns the index set of locally owned indices.
+     *
+     * @return Reference to the IndexSet of locally owned indices.
+     */
+    [[nodiscard]] const IndexSet &
+    locally_owned_range() const;
+
+    /**
+     * @brief Returns the associated MPI communicator.
+     *
+     * @return MPI communicator used for partitioning.
+     */
+    [[nodiscard]] MPI_Comm
+    get_communicator() const;
+
+    /**
+     * @brief Returns the number of locally owned indices.
+     *
+     * @return Size of the locally owned index set.
+     */
+    [[nodiscard]] unsigned
+    locally_owned_size() const;
+
+    /**
+     * @brief Returns the number of ghost indices.
+     *
+     * @return Size of the ghost index set.
+     */
+    [[nodiscard]] unsigned
+    ghost_size() const;
+
+    /**
+     * @brief Checks compatibility with another partitioner.
+     *
+     * @param partitioner The partitioner to compare with.
+     * @return True if both partitioners are compatible, i.e. ghost indices and
+     * locally owned indices are the same.
+     */
+    [[nodiscard]] bool
+    is_compatible(const Partitioner &partitioner) const;
+
+    /**
+     * @brief Returns the total size of the global index space.
+     *
+     * @return The total number of global indices.
+     */
+    [[nodiscard]] unsigned
+    get_global_size() const;
+
+    /**
+     * @brief Initiates export of data from locally owned to ghosted array using
+     * non-blocking communication.
+     *
+     * @param locally_owned_array The source array of owned data.
+     * @param ghost_array The local destination array for ghost data.
+     */
+    template <std::ranges::contiguous_range ContigView>
+    void
+    export_to_ghosted_array_start(const ContigView &locally_owned_array,
+                                  ContigView       &ghost_array);
+
+    /**
+     * @brief Completes the export to the ghosted array after non-blocking MPI
+     * communication.
+     *
+     * @param ghost_array The ghost array to finalize and store the ghost
+     * elements in.
+     */
+    template <std::ranges::contiguous_range ContigView>
+    void
+    export_to_ghosted_array_finish(ContigView &ghost_array);
+
+  private:
+    /**
+     * @brief Determines the total number of global indices across all MPI
+     * ranks.
+     */
+    void
+    determine_global_size();
+
+    /**
+     * @brief Establishes the communication pattern for ghost value exchange.
+     */
+    void
+    determine_communication_pattern();
+
+    /// Total number of global indices.
+    unsigned global_size{};
+
+    /// Locally owned global indices.
+    mutable IndexSet locally_owned_indices{};
+
+    /// Ghost global indices.
+    mutable IndexSet ghost_indices;
+
+    /// List of target MPI ranks and their corresponding indices to which this
+    /// process sends data.
+    std::vector<std::pair<int, IndexSet>> export_targets_and_indices;
+
+    /// List of source MPI ranks and their corresponding indices from which this
+    /// process receives ghost data.
+    std::vector<std::pair<int, IndexSet>> import_targets_and_indices;
+
+    /// MPI requests for non-blocking communication used when updating the
+    /// ghost values
+    std::vector<MPI_Request> request;
+
+    /// The MPI communicator used.
+    MPI_Comm communicator{MPI_COMM_SELF};
+
+    /// Rank and size of the MPI communicator.
+    int comm_rank{-1}, comm_size{-1};
+  };
+} // namespace i2phpp
+
+
+template <std::ranges::contiguous_range ContigView>
+void
+i2phpp::Partitioner::export_to_ghosted_array_finish(ContigView &ghost_array)
+{
+  if (!request.empty())
+    {
+      // Block until all background communication from 'start' is finished
+      MPI_Waitall(request.size(), request.data(), MPI_STATUSES_IGNORE);
+      request.clear();
+    }
+}
+
+
+template <std::ranges::contiguous_range ContigView>
+void
+i2phpp::Partitioner::export_to_ghosted_array_start(
+  const ContigView &locally_owned_array,
+  ContigView       &ghost_array)
+{
+  // Calculate the total number of individual elements to send and receive.
+  unsigned total_requests = 0;
+  for (const auto &[rank, index_set] : export_targets_and_indices)
+    total_requests += index_set.size();
+  for (const auto &[rank, index_set] : import_targets_and_indices)
+    total_requests += index_set.size();
+
+  // Clear previous requests and reserve memory to hold all MPI requests
+  // for non-blocking communication without reallocating
+  request.clear();
+  request.reserve(total_requests);
+
+  // Post non-blocking receives for each individual ghost element
+  for (const auto &[rank, index_set] : import_targets_and_indices)
+    {
+      const auto &indices = index_set.get_indices();
+      for (unsigned i = 0; i < indices.size(); i++)
+        {
+          unsigned global_idx      = indices[i]; // extract the global index
+          unsigned local_ghost_idx = ghost_indices.index_within_set(
+            global_idx); // calculate the local index in the ghost array
+
+          // Add a new empty request object to our tracking vector.
+          request.emplace_back();
+
+          // Receive directly into the specific memory address in the
+          // ghost_array.
+          MPI_Irecv(&ghost_array[local_ghost_idx],
+                    1,
+                    MPI_DOUBLE,
+                    rank,
+                    global_idx, // We use the global_idx as tag
+                    communicator,
+                    &request.back());
+        }
+    }
+
+  // Post non-blocking sends for each individual locally owned element.
+  for (const auto &[rank, index_set] : export_targets_and_indices)
+    {
+      const auto &indices = index_set.get_indices();
+      for (unsigned i = 0; i < indices.size(); i++)
+        {
+          unsigned global_idx      = indices[i]; // extract the global index
+          unsigned local_owned_idx = locally_owned_indices.index_within_set(
+            global_idx); // calculate the local index in the locally owned array
+
+          // Add a new empty request object to our tracking vector.
+          request.emplace_back();
+
+          // Send directly from the specific memory address in the
+          // locally_owned_array. Initiates send operation and returns
+          // immediately
+          MPI_Isend(&locally_owned_array[local_owned_idx],
+                    1,
+                    MPI_DOUBLE,
+                    rank,
+                    global_idx, // We use the global_idx as tag
+                    communicator,
+                    &request.back());
+        }
+    }
+}
+
+
+
+
+PARTITIONER.CPP
+
+#include <i2phpp/util/asserts.hpp>
+#include <i2phpp/util/partitioner.hpp>
+#include <mpi.h>
+
+#include <string>
+#include <utility>
+
+i2phpp::Partitioner::Partitioner(i2phpp::IndexSet locally_owned_indices,
+                                 i2phpp::IndexSet ghost_indices,
+                                 MPI_Comm         communicator)
+  : locally_owned_indices(std::move(locally_owned_indices))
+  , ghost_indices(std::move(ghost_indices))
+  , communicator(communicator)
+{
+  assert_release(
+    this->locally_owned_indices.is_contiguous(),
+    std::string(
+      "Locally owned index range must be contiguous! Please check the input "
+      "parameters!"),
+    MPI_COMM_WORLD);
+
+  MPI_Comm_size(this->communicator, &comm_size);
+  MPI_Comm_rank(this->communicator, &comm_rank);
+  request.reserve(comm_size);
+  determine_global_size();
+  determine_communication_pattern();
+}
+
+
+i2phpp::Partitioner::Partitioner(i2phpp::IndexSet locally_owned_indices,
+                                 MPI_Comm         communicator)
+  : locally_owned_indices(std::move(locally_owned_indices))
+  , communicator(communicator)
+{
+  assert_release(
+    this->locally_owned_indices.is_contiguous(),
+    std::string(
+      "Locally owned index range must be contiguous! Please check the input "
+      "parameters!"),
+    MPI_COMM_WORLD);
+
+  MPI_Comm_size(this->communicator, &comm_size);
+  MPI_Comm_rank(this->communicator, &comm_rank);
+  determine_global_size();
+}
+
+
+void
+i2phpp::Partitioner::determine_global_size()
+{
+  const unsigned locally_owned_size = locally_owned_indices.size();
+  MPI_Allreduce(
+    &locally_owned_size, &global_size, 1, MPI_UNSIGNED, MPI_SUM, communicator);
+}
+
+
+void
+i2phpp::Partitioner::determine_communication_pattern()
+{
+  if (comm_size < 2)
+    return;
+
+  // Step 1: Send requests to all processes in the communicator
+  // TODO
+  // gather all ghost indices from all processes into a single array
+  const std::vector<unsigned> &my_ghosts      = ghost_indices.get_indices();
+  int                          my_ghost_count = my_ghosts.size();
+
+  // Gather the number of ghost indices from all processes to determine the
+  // total size of the gathered array and the displacements for each process's
+  // data.
+  std::vector<int> ghost_counts(comm_size);
+  MPI_Allgather(
+    &my_ghost_count, 1, MPI_INT, ghost_counts.data(), 1, MPI_INT, communicator);
+
+  // calculate displacements for the gathered ghost indices e.g. if rank 0 has 2
+  // ghosts, rank 1 has 3 ghosts, and rank 2 has 1 ghost, the displacements
+  // would be [0, 2, 5] for the gathered array of size 6
+  std::vector<int> ghost_displs(comm_size, 0);
+  int              total_ghosts = ghost_counts[0];
+  for (int i = 1; i < comm_size; i++)
+    {
+      ghost_displs[i] = ghost_displs[i - 1] + ghost_counts[i - 1];
+      total_ghosts += ghost_counts[i];
+    }
+
+  // gather all ghost indices from all processes into a single array
+  std::vector<unsigned> all_ghosts(total_ghosts);
+  MPI_Allgatherv(my_ghosts.data(),
+                 my_ghost_count,
+                 MPI_UNSIGNED,
+                 all_ghosts.data(),
+                 ghost_counts.data(),
+                 ghost_displs.data(),
+                 MPI_UNSIGNED,
+                 communicator);
+
+  // Step 2: If any of the locally owned indices match ghost indices of other
+  // processes and store them
+  // TODO
+  for (int r = 0; r < comm_size; r++)
+    {
+      if (r == comm_rank)
+        continue; // Skip our own process
+
+      i2phpp::IndexSet temp;
+
+      // Loop only through the specific chunk of requested ghosts for rank r
+      for (int i = 0; i < ghost_counts[r]; i++)
+        {
+          unsigned index = all_ghosts[ghost_displs[r] + i];
+
+          // Check if this process owns the requested index
+          if (locally_owned_indices.is_element(index))
+            temp.add_index(index);
+        }
+
+      // If we own any of the requested data, add it to our export targets
+      if (temp.size() > 0)
+        export_targets_and_indices.push_back({r, temp});
+    }
+
+
+  // Step 3: Inform other processes about the any indices which are locally
+  // owned and requested by the other processes
+  // TODO
+
+  // Prepare an array of sizes to send to each rank
+  std::vector<int> send_sizes(comm_size, 0);
+  for (const auto &[rank, index_set] : export_targets_and_indices)
+    {
+      send_sizes[rank] = index_set.size();
+    }
+
+  // Gather the sizes of the data to be received from each rank
+  std::vector<int> recv_sizes(comm_size, 0);
+  MPI_Alltoall(
+    send_sizes.data(), 1, MPI_INT, recv_sizes.data(), 1, MPI_INT, communicator);
+
+  // Pre-allocate temporary receive buffers and target entries for imports
+  std::vector<std::pair<int, std::vector<unsigned>>> temp_imports;
+
+  // Vector to track all non-blocking communication requests for synchronization
+  std::vector<MPI_Request> requests;
+
+  // Post receives for the incoming data based on the sizes
+  for (int r = 0; r < comm_size; r++)
+    {
+      if (recv_sizes[r] > 0)
+        {
+          // Allocate a vector of the exact size we expect from rank 'r'
+          std::vector<unsigned> temp(recv_sizes[r]);
+          temp_imports.push_back({r, std::move(temp)});
+
+          // Get a reference to the vector we just stored in temp_imports
+          auto &buffer = temp_imports.back().second;
+
+          // Post the non-blocking receive directly into this buffer
+          requests.emplace_back();
+          MPI_Irecv(buffer.data(),
+                    buffer.size(),
+                    MPI_UNSIGNED,
+                    r,
+                    1,
+                    communicator,
+                    &requests.back());
+        }
+    }
+
+  // Post sends for the outgoing data we already own
+  for (const auto &[rank, index_set] : export_targets_and_indices)
+    {
+      const auto &indices = index_set.get_indices();
+
+      // Post the non-blocking send for the raw index data
+      requests.emplace_back();
+      MPI_Isend(indices.data(),
+                indices.size(),
+                MPI_UNSIGNED,
+                rank,
+                1,
+                communicator,
+                &requests.back());
+    }
+
+  // Wait for all background sends and receives to finish
+  if (!requests.empty())
+    {
+      MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    }
+
+  // Pack the raw data into the final IndexSet structures
+  for (const auto &[source_rank, buffer] : temp_imports)
+    {
+      i2phpp::IndexSet imported_set;
+      for (unsigned idx : buffer)
+        {
+          imported_set.add_index(idx);
+        }
+      import_targets_and_indices.push_back({source_rank, imported_set});
+    }
+}
+
+bool
+i2phpp::Partitioner::in_locally_owned_range(unsigned int global_index) const
+{
+  return locally_owned_indices.is_element(global_index);
+}
+
+
+unsigned
+i2phpp::Partitioner::global_to_local(unsigned int global_index) const
+{
+  if (in_locally_owned_range(global_index))
+    {
+      return locally_owned_indices.index_within_set(global_index);
+    }
+  if (in_locally_relevant_range(global_index))
+    {
+      return locally_owned_indices.size() +
+             ghost_indices.index_within_set(global_index);
+    }
+  else
+    {
+      assert_release(false,
+                     std::string(
+                       "The provided global index (" +
+                       std::to_string(global_index) +
+                       ") is not in the range of locally relevant indices!"),
+                     MPI_COMM_WORLD);
+    }
+  return -1;
+}
+
+
+unsigned
+i2phpp::Partitioner::local_to_global(unsigned int local_index) const
+{
+  return locally_owned_indices.nth_index_in_set(local_index);
+}
+
+
+const i2phpp::IndexSet &
+i2phpp::Partitioner::locally_owned_range() const
+{
+  return locally_owned_indices;
+}
+
+
+MPI_Comm
+i2phpp::Partitioner::get_communicator() const
+{
+  return communicator;
+}
+
+
+unsigned
+i2phpp::Partitioner::locally_owned_size() const
+{
+  return locally_owned_indices.size();
+}
+
+
+unsigned
+i2phpp::Partitioner::ghost_size() const
+{
+  return ghost_indices.size();
+}
+
+
+bool
+i2phpp::Partitioner::is_compatible(const i2phpp::Partitioner &partitioner) const
+{
+  return (std::equal(locally_owned_indices.begin(),
+                     locally_owned_indices.end(),
+                     partitioner.locally_owned_indices.begin()) &&
+          std::equal(ghost_indices.begin(),
+                     ghost_indices.end(),
+                     partitioner.ghost_indices.begin()));
+}
+
+unsigned
+i2phpp::Partitioner::get_global_size() const
+{
+  return global_size;
+}
+
+bool
+i2phpp::Partitioner::in_locally_relevant_range(unsigned int global_index) const
+{
+  return in_locally_owned_range(global_index) ||
+         ghost_indices.is_element(global_index);
+}
+
+
+
+
+DOF_HANDLER.CPP
+
+#include <i2phpp/util/asserts.hpp>
+#include <i2phpp/util/dof_handler.hpp>
+
+#include <algorithm>
+#include <ranges>
+#include <string>
+
+template <int dim, typename number>
+i2phpp::DoFHandler<dim, number>::DoFHandler(
+  const HeatData<dim, number> &heat_data)
+  : heat_data(heat_data)
+{}
+
+
+template <int dim, typename number>
+std::size_t
+i2phpp::DoFHandler<dim, number>::get_array_index(
+  const std::array<std::size_t, dim> &cartesian_index) const
+{
+  assert_debug(
+    std::ranges::all_of(std::views::iota(0, dim),
+                        [&](const unsigned i) {
+                          return cartesian_index[i] < heat_data.grid.n_dofs[i];
+                        }),
+    "The index combination for computing the array index is not valid!");
+
+  std::size_t array_index = 0;
+  std::size_t stride      = 1;
+
+  for (unsigned int i = 0; i < dim; ++i)
+    {
+      array_index += stride * cartesian_index[i];
+      stride *= heat_data.grid.n_dofs[i];
+    }
+
+  return array_index;
+}
+
+
+template <int dim, typename number>
+std::array<std::size_t, dim>
+i2phpp::DoFHandler<dim, number>::get_cartesian_index(std::size_t index) const
+{
+  static_assert((dim > 0) && (dim < 4),
+                "The implementation only supports 1 <= dimension <= 3!");
+
+  if constexpr (dim == 1)
+    {
+      return {index};
+    }
+  else if constexpr (dim == 2)
+    {
+      return {index % heat_data.grid.n_dofs[0],
+              index / heat_data.grid.n_dofs[0]};
+    }
+  else if constexpr (dim == 3)
+    {
+      // For 3D, first compute the z-coordinate (layer index) by dividing the
+      // total index by the total number of DOFs in a two-dimensional layer.
+      std::size_t z_index =
+        index / (heat_data.grid.n_dofs[0] * heat_data.grid.n_dofs[1]);
+
+      // Subtract the number of DOFs in the lower layers to get the
+      // 2D-equivalent index.
+      index -= z_index * (heat_data.grid.n_dofs[0] * heat_data.grid.n_dofs[1]);
+
+      // For the remaining 2D index, calculate the x and y coordinates as
+      // before.
+      return {index % heat_data.grid.n_dofs[0],
+              index / heat_data.grid.n_dofs[0],
+              z_index};
+    }
+}
+
+template <int dim, typename number>
+bool
+i2phpp::DoFHandler<dim, number>::at_boundary(std::size_t index) const
+{
+  std::array<std::size_t, dim> cartesian_indices = get_cartesian_index(index);
+  for (unsigned int dimension = 0; dimension < dim; ++dimension)
+    if (cartesian_indices[dimension] == 0 ||
+        cartesian_indices[dimension] == heat_data.grid.n_dofs[dimension] - 1)
+      return true;
+  return false;
+}
+
+
+template <int dim, typename number>
+std::array<number, dim>
+i2phpp::DoFHandler<dim, number>::get_physical_location(
+  const std::array<std::size_t, dim> &index) const
+{
+  assert_debug(
+    std::ranges::all_of(std::views::iota(0, dim),
+                        [&](const unsigned i) -> bool {
+                          return index[i] < heat_data.grid.n_dofs[i];
+                        }),
+    "The index combination for computing the global index is not valid!");
+
+  std::array<number, dim> coordinates{};
+  for (unsigned int i = 0; i < dim; ++i)
+    {
+      coordinates[i] =
+        static_cast<number>(index[i]) * heat_data.grid.delta_grid[i];
+    }
+  return coordinates;
+}
+
+template <int dim, typename number>
+std::array<number, dim>
+i2phpp::DoFHandler<dim, number>::get_physical_location(
+  const std::size_t index) const
+{
+  return get_physical_location(get_cartesian_index(index));
+}
+
+template <int dim, typename number>
+void
+i2phpp::DoFHandler<dim, number>::initialize_dof_vector(
+  i2phpp::ParallelDistributedVector &dof_vector,
+  const double                       init_value) const
+{
+  MPI_Comm comm = MPI_COMM_WORLD;
+  int      rank, size;
+  MPI_Comm_rank(comm, &rank);
+  MPI_Comm_size(comm, &size);
+
+  // TODO
+  int max_slices = heat_data.grid.n_dofs[dim - 1];
+
+  // If there are more processes than slices, we need to split the communicator
+  if (size > max_slices)
+    {
+      // Ranks less than max_slices get color 0 (stay active).
+      // Ranks greater or equal get MPI_UNDEFINED (become idle).
+      int      color = (rank < max_slices) ? 0 : MPI_UNDEFINED;
+      MPI_Comm new_comm;
+
+      MPI_Comm_split(comm, color, rank, &new_comm);
+      comm = new_comm; // Update the main comm variable
+
+      // If this process was told to sit out, initialize empty and exit early
+      if (comm == MPI_COMM_NULL)
+        {
+          dof_vector = ParallelDistributedVector(MPI_COMM_NULL);
+          return;
+        }
+
+      // Update the rank and size variables to reflect the new, smaller
+      // communicator
+      MPI_Comm_rank(comm, &rank);
+      MPI_Comm_size(comm, &size);
+    }
+
+
+  unsigned int local_length = heat_data.grid.n_dofs[dim - 1] / size;
+
+  unsigned end_offset = rank >= heat_data.grid.n_dofs[dim - 1] % size ?
+                          heat_data.grid.n_dofs[dim - 1] % size :
+                          rank + 1;
+
+  unsigned begin_offset = rank >= heat_data.grid.n_dofs[dim - 1] % size ?
+                            heat_data.grid.n_dofs[dim - 1] % size :
+                            rank;
+
+  // locally owned size
+  unsigned local_size           = (local_length);
+  unsigned elements_per_segment = 1;
+  for (int dimension = dim - 2; dimension >= 0; --dimension)
+    {
+      elements_per_segment *= heat_data.grid.n_dofs[dimension];
+      local_size *= heat_data.grid.n_dofs[dimension];
+    }
+
+  // local index set
+  IndexSet locally_owned_indices(rank * local_size +
+                                   begin_offset * elements_per_segment,
+                                 (rank + 1) * local_size +
+                                   end_offset * elements_per_segment);
+
+  // ghost index set
+  IndexSet ghost_indices;
+
+  // Note in 1D n_y = n_z = 1, and in 2D n_z = 1
+  if (rank == 0)
+    for (int j = 0; j < heat_data.grid.n_dofs[1]; ++j)   // 3D
+      for (int i = 0; i < heat_data.grid.n_dofs[0]; ++i) // 2D
+        ghost_indices.add_index(local_size + end_offset * elements_per_segment +
+                                j * heat_data.grid.n_dofs[1] + i);
+  else if (rank == size - 1)
+    for (int j = 0; j < heat_data.grid.n_dofs[1]; ++j)   // 3D
+      for (int i = 0; i < heat_data.grid.n_dofs[0]; ++i) // 2D
+        ghost_indices.add_index(rank * local_size +
+                                begin_offset * elements_per_segment - 1 -
+                                j * heat_data.grid.n_dofs[1] - i);
+  else
+    {
+      for (int j = 0; j < heat_data.grid.n_dofs[1]; ++j)   // 3D
+        for (int i = 0; i < heat_data.grid.n_dofs[0]; ++i) // 2D
+          {
+            ghost_indices.add_index(rank * local_size +
+                                    begin_offset * elements_per_segment - 1 -
+                                    j * heat_data.grid.n_dofs[1] - i);
+            ghost_indices.add_index((rank + 1) * local_size +
+                                    end_offset * elements_per_segment +
+                                    j * heat_data.grid.n_dofs[1] + i);
+          }
+    }
+
+  dof_vector.reinit(locally_owned_indices, ghost_indices, init_value, comm);
+}
+
+
+template class i2phpp::DoFHandler<1, double>;
+template class i2phpp::DoFHandler<2, double>;
+template class i2phpp::DoFHandler<3, double>;
+
+template class i2phpp::DoFHandler<1, float>;
+template class i2phpp::DoFHandler<2, float>;
+template class i2phpp::DoFHandler<3, float>;
+
+
+
+
+PARALLEL_DISTRIBUTED_VECTOR.CPP
+
+#include <i2phpp/linear_algebra/parallel_distributed_vector.hpp>
+#include <i2phpp/util/asserts.hpp>
+#include <i2phpp/util/index_set.hpp>
+#include <i2phpp/util/partitioner.hpp>
+#include <mpi.h>
+
+#include <cmath>
+#include <span>
+#include <string>
+
+using namespace i2phpp;
+
+ParallelDistributedVector::ParallelDistributedVector(MPI_Comm communicator)
+  : communicator(communicator)
+{}
+
+
+ParallelDistributedVector::ParallelDistributedVector(
+  const Partitioner &partitioner,
+  double             initial_value)
+  : partitioner(partitioner)
+  , communicator(partitioner.get_communicator())
+  , local_elements(partitioner.locally_owned_size() + partitioner.ghost_size(),
+                   initial_value)
+{}
+
+
+ParallelDistributedVector::ParallelDistributedVector(
+  const IndexSet &local_range,
+  MPI_Comm        communicator,
+  double          initial_value)
+  : partitioner(local_range, communicator)
+  , communicator(communicator)
+  , local_elements(local_range.size(), initial_value)
+{}
+
+
+i2phpp::ParallelDistributedVector::ParallelDistributedVector(
+  const i2phpp::IndexSet &local_range,
+  const i2phpp::IndexSet &ghost_indices,
+  MPI_Comm                communicator,
+  double                  initial_value)
+  : partitioner(local_range, ghost_indices, communicator)
+  , communicator(communicator)
+  , local_elements(local_range.size() + ghost_indices.size(), initial_value)
+{}
+
+
+void
+i2phpp::ParallelDistributedVector::reinit(const IndexSet &locally_owned_indices,
+                                          const IndexSet &ghost_indices,
+                                          const double    initial_value,
+                                          MPI_Comm        comm)
+{
+  communicator = comm;
+  partitioner = Partitioner(locally_owned_indices, ghost_indices, communicator);
+  local_elements.clear();
+  local_elements.resize(locally_owned_size() + partitioner.ghost_size(),
+                        initial_value);
+}
+
+
+double &
+i2phpp::ParallelDistributedVector::local_element(const unsigned local_index)
+{
+  return local_elements[local_index];
+}
+
+
+const double &
+i2phpp::ParallelDistributedVector::local_element(
+  const unsigned local_index) const
+{
+  return local_elements[local_index];
+}
+
+
+double &
+i2phpp::ParallelDistributedVector::global_element(unsigned int global_index)
+{
+  return local_elements[partitioner.global_to_local(global_index)];
+}
+
+
+const double &
+i2phpp::ParallelDistributedVector::global_element(
+  unsigned int global_index) const
+{
+  return local_elements[partitioner.global_to_local(global_index)];
+}
+
+
+double
+i2phpp::ParallelDistributedVector::gather_global_element(
+  const unsigned global_index) const
+{
+  assert_release(global_index < partitioner.get_global_size(),
+                 std::string(
+                   "The global index you have passed to the function is great "
+                   "than the total (global) number of elements in the vector."),
+                 communicator);
+
+  double element;
+  int    size, rank;
+  MPI_Comm_size(communicator, &size);
+  MPI_Comm_rank(communicator, &rank);
+  if (partitioner.in_locally_owned_range(global_index))
+    {
+      element = local_elements[partitioner.global_to_local(global_index)];
+      for (int receiver = 0; receiver < size; ++receiver)
+        {
+          if (receiver != rank)
+            MPI_Send(&element,
+                     1,
+                     MPI_DOUBLE,
+                     receiver,
+                     static_cast<int>(global_index),
+                     communicator);
+        }
+    }
+  else
+    {
+      MPI_Recv(&element,
+               1,
+               MPI_DOUBLE,
+               MPI_ANY_SOURCE,
+               static_cast<int>(global_index),
+               communicator,
+               MPI_STATUS_IGNORE);
+    }
+  MPI_Barrier(communicator);
+  return element;
+}
+
+
+unsigned
+i2phpp::ParallelDistributedVector::locally_owned_size() const
+{
+  return partitioner.locally_owned_size();
+}
+
+
+unsigned
+i2phpp::ParallelDistributedVector::ghost_size() const
+{
+  return partitioner.ghost_size();
+}
+
+
+double
+i2phpp::ParallelDistributedVector::dot_product(
+  const i2phpp::ParallelDistributedVector &other) const
+{
+  assert_compatibility(other);
+
+  double local_dot = 0.0;
+  // Crucial: Only sum the locally owned elements to avoid double-counting ghost
+  // values
+  for (unsigned i = 0; i < locally_owned_size(); ++i)
+    {
+      local_dot += local_elements[i] * other.local_elements[i];
+    }
+
+  double global_dot = 0.0;
+
+  // Combine all local partial sums into the final global sum across all
+  // processes
+  MPI_Allreduce(&local_dot, &global_dot, 1, MPI_DOUBLE, MPI_SUM, communicator);
+
+  return global_dot;
+}
+
+double
+i2phpp::ParallelDistributedVector::l2_norm() const
+{
+  // The L2 norm is simply the square root of the vector dotted with itself
+  return std::sqrt(dot_product(*this));
+}
+
+void
+i2phpp::ParallelDistributedVector::operator*=(const double num)
+{
+  for (double &val : local_elements)
+    {
+      val *= num;
+    }
+}
+
+
+i2phpp::ParallelDistributedVector
+i2phpp::ParallelDistributedVector::operator*(const double num) const
+{
+  ParallelDistributedVector result(*this);
+  result *= num;
+  return result;
+}
+
+void
+i2phpp::ParallelDistributedVector::operator+=(
+  const ParallelDistributedVector &vec)
+{
+  assert_compatibility(vec);
+  for (std::size_t i = 0; i < local_elements.size(); ++i)
+    {
+      local_elements[i] += vec.local_elements[i];
+    }
+}
+
+
+i2phpp::ParallelDistributedVector
+i2phpp::ParallelDistributedVector::operator+(
+  const ParallelDistributedVector &vec) const
+{
+  assert_compatibility(vec);
+  ParallelDistributedVector result(*this);
+  result += vec;
+  return result;
+}
+
+
+void
+i2phpp::ParallelDistributedVector::operator-=(
+  const ParallelDistributedVector &vec)
+{
+  assert_compatibility(vec);
+  for (std::size_t i = 0; i < local_elements.size(); ++i)
+    {
+      local_elements[i] -= vec.local_elements[i];
+    }
+}
+
+i2phpp::ParallelDistributedVector
+i2phpp::ParallelDistributedVector::operator-(
+  const ParallelDistributedVector &vec) const
+{
+  assert_compatibility(vec);
+  ParallelDistributedVector result(*this);
+  result -= vec;
+  return result;
+}
+
+void
+i2phpp::ParallelDistributedVector::update_ghost_values()
+{
+  std::span<double> locally_owned_elements(local_elements.data(),
+                                           locally_owned_size());
+  std::span<double> ghost_elements(local_elements.data() + locally_owned_size(),
+                                   partitioner.ghost_size());
+
+  partitioner.export_to_ghosted_array_start(locally_owned_elements,
+                                            ghost_elements);
+  partitioner.export_to_ghosted_array_finish(ghost_elements);
+}
+
+bool
+i2phpp::ParallelDistributedVector::is_compatible(
+  const i2phpp::ParallelDistributedVector &other) const
+{
+  return partitioner.is_compatible(other.partitioner);
+}
+
+unsigned
+i2phpp::ParallelDistributedVector::global_size() const
+{
+  return partitioner.get_global_size();
+}
+
+void
+i2phpp::ParallelDistributedVector::swap(
+  i2phpp::ParallelDistributedVector &other)
+{
+  local_elements.swap(other.local_elements);
+}
+
+
+const i2phpp::Partitioner &
+i2phpp::ParallelDistributedVector::get_partitioner() const
+{
+  return partitioner;
+}
+
+
+MPI_Comm
+i2phpp::ParallelDistributedVector::get_communicator() const
+{
+  return communicator;
+}
+
+
+void
+i2phpp::ParallelDistributedVector::assert_compatibility(
+  const i2phpp::ParallelDistributedVector &other) const
+{
+  assert_release(is_compatible(other),
+                 std::string(
+                   "The parallel layout of the two distributed vectors you are "
+                   "working on is not compatible!"),
+                 communicator);
+}
+
+
+
+
+
+HEAT_OPERATOR.CPP
+
+#include <i2phpp/heat_equation/heat_data.hpp>
+#include <i2phpp/heat_equation/heat_operator.hpp>
+#include <i2phpp/linear_algebra/parallel_distributed_vector.hpp>
+
+using namespace i2phpp;
+
+template <int dim>
+HeatOperator<dim>::HeatOperator(const HeatData<dim, double>   &heat_data,
+                                const DoFHandler<dim, double> &dof_handler)
+  : heat_data(heat_data)
+  , dof_handler(dof_handler)
+  , current_solution(MPI_COMM_WORLD)
+  , old_solution(MPI_COMM_WORLD)
+{
+  // TODO: Properly initialize dof vector (use dof handler function from task 3)
+  dof_handler.initialize_dof_vector(current_solution, heat_data.T_init);
+  dof_handler.initialize_dof_vector(old_solution, heat_data.T_init);
+
+  if (current_solution.get_communicator() != MPI_COMM_NULL)
+    {
+      apply_boundary_conditions();
+      old_solution = current_solution;
+    }
+}
+
+
+template <int dim>
+void
+HeatOperator<dim>::advance_time_step(const double current_time,
+                                     const double current_time_increment)
+{
+  if (current_solution.get_communicator() != MPI_COMM_NULL)
+    {
+      if (heat_data.time_integrator_type == TimeIntegrator::explicit_euler)
+        {
+          // TODO: Use correct MPI building blocks
+          /// Perform the explicit Euler time step using a matrix-free approach
+          current_solution.swap(old_solution);
+          // Sync ghost entries of old_solution from adjacent MPI ranks
+          old_solution.update_ghost_values();
+
+          const double old_time    = current_time - current_time_increment;
+          const auto  &partitioner = current_solution.get_partitioner();
+
+          // Loop over locally owned DoFs on this process
+          for (unsigned local_index = 0;
+               local_index < current_solution.locally_owned_size();
+               ++local_index)
+            {
+              // Convert local array index to its global DoF index
+              unsigned global_index = partitioner.local_to_global(local_index);
+
+              if (!dof_handler.at_boundary(global_index))
+                {
+                  current_solution.local_element(local_index) =
+                    old_solution.local_element(local_index) +
+                    current_time_increment *
+                      (matrix_free_stencil(global_index, old_solution) +
+                       source_term(old_time, global_index));
+                }
+            }
+        }
+      else if (heat_data.time_integrator_type == TimeIntegrator::implicit_euler)
+        {
+          // TODO: Use correct MPI building blocks
+          current_solution.swap(old_solution);
+          ParallelDistributedVector old_iter = old_solution;
+          double                    res  = std::numeric_limits<double>::max();
+          unsigned                  iter = 0;
+          while (res > heat_data.iterative_solver_tolerance && iter < 1000)
+            {
+              // update ghost values of old_iter from adjacent MPI ranks
+              old_iter.update_ghost_values();
+
+              for (unsigned i = 0; i < current_solution.locally_owned_size();
+                   ++i)
+                {
+                  unsigned global_index =
+                    current_solution.get_partitioner().local_to_global(i);
+
+                  if (!dof_handler.at_boundary(global_index))
+                    {
+                      current_solution.global_element(global_index) =
+                        jacobi_update(global_index,
+                                      current_time,
+                                      current_time_increment,
+                                      old_iter,
+                                      old_solution);
+                    }
+                }
+
+              res = 0.;
+              current_solution.update_ghost_values();
+
+              for (unsigned i = 0; i < current_solution.locally_owned_size();
+                   ++i)
+                {
+                  unsigned global_index =
+                    current_solution.get_partitioner().local_to_global(i);
+
+                  if (!dof_handler.at_boundary(global_index))
+                    {
+                      double loc_res =
+                        old_solution.local_element(i) +
+                        current_time_increment *
+                          (matrix_free_stencil(global_index, current_solution) +
+                           source_term(current_time, global_index)) -
+                        current_solution.local_element(i);
+                      res += loc_res * loc_res;
+                    }
+                }
+              MPI_Allreduce(
+                MPI_IN_PLACE, // can't pass &res both as input and output
+                &res,
+                1,
+                MPI_DOUBLE,
+                MPI_SUM,
+                current_solution.get_communicator());
+              res      = std::sqrt(res) / current_solution.l2_norm();
+              old_iter = current_solution;
+              ++iter;
+            }
+        }
+      else
+        assert_release(false,
+                       "The provided solver type is not supported!",
+                       MPI_COMM_WORLD);
+    }
+}
+
+template <int dim>
+const ParallelDistributedVector &
+HeatOperator<dim>::get_current_solution() const
+{
+  return current_solution;
+}
+
+template <int dim>
+ParallelDistributedVector &
+HeatOperator<dim>::get_current_solution()
+{
+  return current_solution;
+}
+
+template <int dim>
+void
+HeatOperator<dim>::apply_boundary_conditions()
+{
+  // TODO: Use correct MPI building blocks
+  if (current_solution.get_communicator() != MPI_COMM_NULL)
+    {
+      for (unsigned local_index = 0;
+           local_index < current_solution.locally_owned_size();
+           ++local_index)
+        {
+          // Map local array slot to the true global DoF index
+          unsigned global_index =
+            current_solution.get_partitioner().local_to_global(local_index);
+
+          if (dof_handler.at_boundary(global_index))
+            {
+              for (unsigned int dimension = 0; dimension < dim; ++dimension)
+                if (dof_handler.get_cartesian_index(global_index)[dimension] ==
+                    0)
+                  {
+                    current_solution.local_element(local_index) =
+                      heat_data.boundary_conditions.values[dimension][0];
+                  }
+                else if (dof_handler.get_cartesian_index(
+                           global_index)[dimension] ==
+                         heat_data.grid.n_dofs[dimension] - 1)
+                  current_solution.local_element(local_index) =
+                    heat_data.boundary_conditions.values[dimension][1];
+            }
+        }
+    }
+}
+
+template <int dim>
+double
+HeatOperator<dim>::source_term(const double      current_time,
+                               const std::size_t index) const
+{
+  std::array<double, dim> location = dof_handler.get_physical_location(index);
+  return heat_data.source(current_time, location);
+}
+
+template <int dim>
+double
+HeatOperator<dim>::matrix_free_stencil(
+  const std::size_t                global_index,
+  const ParallelDistributedVector &solution) const
+{
+  // TODO: Use correct MPI building blocks
+  std::array<std::size_t, dim> offset{};
+  offset[0] = 1;
+  for (std::size_t i = 1; i < dim; ++i)
+    {
+      offset[i] = offset[i - 1] * heat_data.grid.n_dofs[i - 1];
+    }
+
+  auto   local_indices = dof_handler.get_cartesian_index(global_index);
+  double result        = 0;
+  for (unsigned int dimension = 0; dimension < dim; ++dimension)
+    {
+      auto delta_grid_squared_inverse =
+        1. / (heat_data.grid.delta_grid[dimension] *
+              heat_data.grid.delta_grid[dimension]);
+
+      // change local_element to global_element everywhere
+      result += heat_data.thermal_diffusivity(
+                  dof_handler.get_physical_location(local_indices)) *
+                delta_grid_squared_inverse *
+                (solution.global_element(global_index - offset[dimension]) -
+                 2. * solution.global_element(global_index) +
+                 solution.global_element(global_index + offset[dimension]));
+
+      result +=
+        0.25 * delta_grid_squared_inverse *
+        (heat_data.thermal_diffusivity(dof_handler.get_physical_location(
+           global_index + offset[dimension])) -
+         heat_data.thermal_diffusivity(dof_handler.get_physical_location(
+           global_index - offset[dimension]))) *
+        (solution.global_element(global_index + offset[dimension]) -
+         solution.global_element(global_index - offset[dimension]));
+    }
+  return result;
+}
+
+template <int dim>
+double
+HeatOperator<dim>::jacobi_update(
+  const std::size_t                global_index,
+  const double                     time,
+  const double                     current_time_increment,
+  const ParallelDistributedVector &old_iter_vector,
+  const ParallelDistributedVector &rhs) const
+{
+  // TODO: Use correct MPI building blocks
+  std::array<std::size_t, dim> offset{};
+  offset[0] = 1;
+  for (std::size_t i = 1; i < dim; ++i)
+    {
+      offset[i] = offset[i - 1] * heat_data.grid.n_dofs[i - 1];
+    }
+
+  auto cartesian_indices = dof_handler.get_cartesian_index(global_index);
+
+  double result = rhs.global_element(global_index) +
+                  current_time_increment * source_term(time, global_index);
+
+  double multiplicator = 0;
+  for (unsigned int dimension = 0; dimension < dim; ++dimension)
+    {
+      auto delta_grid_squared_inverse =
+        1. / (heat_data.grid.delta_grid[dimension] *
+              heat_data.grid.delta_grid[dimension]);
+
+      result +=
+        current_time_increment *
+        heat_data.thermal_diffusivity(
+          dof_handler.get_physical_location(cartesian_indices)) *
+        delta_grid_squared_inverse *
+        (old_iter_vector.global_element(global_index - offset[dimension]) +
+         old_iter_vector.global_element(global_index + offset[dimension]));
+
+      result +=
+        current_time_increment * 0.25 * delta_grid_squared_inverse *
+        (heat_data.thermal_diffusivity(dof_handler.get_physical_location(
+           global_index + offset[dimension])) -
+         heat_data.thermal_diffusivity(dof_handler.get_physical_location(
+           global_index - offset[dimension]))) *
+        (old_iter_vector.global_element(global_index + offset[dimension]) -
+         old_iter_vector.global_element(global_index - offset[dimension]));
+      multiplicator += delta_grid_squared_inverse;
+    }
+  multiplicator *= heat_data.thermal_diffusivity(
+                     dof_handler.get_physical_location(cartesian_indices)) *
+                   2 * current_time_increment;
+  return result / (multiplicator + 1);
+}
+
+template class i2phpp::HeatOperator<3>;
+template class i2phpp::HeatOperator<2>;
+template class i2phpp::HeatOperator<1>;

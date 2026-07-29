@@ -1,0 +1,2031 @@
+HEAT_OPERATOR.CPP
+
+#include <i2phpp/heat_equation/heat_data.hpp>
+#include <i2phpp/heat_equation/heat_operator.hpp>
+#include <i2phpp/linear_algebra/la_matrix.hpp>
+#include <i2phpp/linear_algebra/la_vector.hpp>
+
+template <int dim,
+          typename number,
+          typename la_vector_type,
+          typename la_matrix_type>
+i2phpp::HeatOperator<dim, number, la_vector_type, la_matrix_type>::HeatOperator(
+  const HeatData<dim, number>   &heat_data,
+  const DoFHandler<dim, number> &dof_handler)
+  : heat_data(heat_data)
+  , dof_handler(dof_handler)
+{
+  set_initial_conditions();
+  if (heat_data.operator_type == OperatorType::matrix_based)
+    setup_finite_difference_heat_equation_system_matrix(heat_data,
+                                                        dof_handler,
+                                                        system_matrix);
+  else
+    old_solution = current_solution;
+}
+
+
+template <int dim,
+          typename number,
+          typename la_vector_type,
+          typename la_matrix_type>
+void
+i2phpp::HeatOperator<dim, number, la_vector_type, la_matrix_type>::
+  advance_time_step(const number current_time,
+                    const number current_time_increment)
+{
+  if (heat_data.operator_type == OperatorType::matrix_based)
+    {
+      // Perform the explicit Euler time step using a matrix-based approach
+      current_solution +=
+        system_matrix * current_solution * current_time_increment +
+        source_term_vector(current_time - current_time_increment) *
+          current_time_increment;
+    }
+  else if (heat_data.operator_type == OperatorType::matrix_free)
+    {
+      // Perform the explicit Euler time step using a matrix-free approach
+      current_solution.swap(old_solution);
+      const number old_time = current_time - current_time_increment;
+
+#pragma omp parallel for default(none) shared(heat_data,                \
+                                                dof_handler,            \
+                                                current_time_increment, \
+                                                old_time,               \
+                                                old_solution,           \
+                                                current_solution)
+      for (std::size_t i = 0; i < heat_data.grid.n_global_dofs; ++i)
+        {
+          if (!dof_handler.at_boundary(i))
+            {
+              current_solution[i] =
+                old_solution[i] +
+                current_time_increment * (matrix_free_stencil(i, old_solution) +
+                                          source_term(old_time, i));
+            }
+        }
+    }
+  else if (heat_data.operator_type == OperatorType::matrix_free_implicit)
+    {
+      current_solution.swap(old_solution);
+      la_vector_type x_old = old_solution;
+
+      // Setup RHS omitting dt to match Worksheet equations (3) and (4)
+      la_vector_type rhs = old_solution;
+#pragma omp parallel for default(none) \
+  shared(heat_data, dof_handler, rhs, current_time)
+      for (std::size_t i = 0; i < heat_data.grid.n_global_dofs; ++i)
+        {
+          if (!dof_handler.at_boundary(i))
+            {
+              // OMITTED current_time_increment multiplication per Julian's
+              // email
+              rhs[i] += source_term(current_time, i);
+            }
+        }
+
+      la_vector_type x_new = x_old;
+      la_vector_type residual_vec(heat_data.grid.n_global_dofs, 0.0);
+
+      // Iterative Jacobi solver loop
+      for (std::size_t iter = 0; iter < 1000; ++iter)
+        {
+#pragma omp parallel for default(none) shared( \
+    heat_data, dof_handler, current_time_increment, x_old, rhs, residual_vec)
+          for (std::size_t i = 0; i < heat_data.grid.n_global_dofs; ++i)
+            {
+              if (!dof_handler.at_boundary(i))
+                {
+                  number A_x_i = x_old[i] - current_time_increment *
+                                              matrix_free_stencil(i, x_old);
+                  residual_vec[i] = A_x_i - rhs[i];
+                }
+              else
+                {
+                  residual_vec[i] = 0.0;
+                }
+            }
+
+          // Relative residual evaluated against the unscaled state norm
+          number r = residual_vec.norm_l2() / x_old.norm_l2();
+
+          if (iter > 0 && r < heat_data.iterative_solver_tolerance)
+            break;
+
+#pragma omp parallel for default(none) shared(heat_data,                \
+                                                dof_handler,            \
+                                                current_time,           \
+                                                current_time_increment, \
+                                                x_old,                  \
+                                                x_new,                  \
+                                                rhs)
+          for (std::size_t i = 0; i < heat_data.grid.n_global_dofs; ++i)
+            {
+              if (!dof_handler.at_boundary(i))
+                {
+                  x_new[i] = jacobi_update(
+                    i, current_time, current_time_increment, x_old, rhs);
+                }
+            }
+
+          x_old = x_new;
+        }
+
+      current_solution = x_old;
+    }
+  else
+    assert_release(false, "The provided solver type is not supported!");
+}
+
+template <int dim,
+          typename number,
+          typename la_vector_type,
+          typename la_matrix_type>
+const la_vector_type &
+i2phpp::HeatOperator<dim, number, la_vector_type, la_matrix_type>::
+  get_current_solution() const
+{
+  return current_solution;
+}
+
+template <int dim,
+          typename number,
+          typename la_vector_type,
+          typename la_matrix_type>
+la_vector_type &
+i2phpp::HeatOperator<dim, number, la_vector_type, la_matrix_type>::
+  get_current_solution()
+{
+  return current_solution;
+}
+
+
+template <int dim,
+          typename number,
+          typename la_vector_type,
+          typename la_matrix_type>
+void
+i2phpp::HeatOperator<dim, number, la_vector_type, la_matrix_type>::
+  set_initial_conditions()
+{
+  current_solution.resize(heat_data.grid.n_global_dofs, heat_data.T_init);
+  // ensure that the initial condition already fulfills the boundary condition
+  apply_boundary_conditions();
+}
+
+
+template <int dim,
+          typename number,
+          typename la_vector_type,
+          typename la_matrix_type>
+void
+i2phpp::HeatOperator<dim, number, la_vector_type, la_matrix_type>::
+  apply_boundary_conditions()
+{
+  for (std::size_t global_index = 0;
+       global_index < heat_data.grid.n_global_dofs;
+       ++global_index)
+    {
+      if (dof_handler.at_boundary(global_index))
+        {
+          for (unsigned int dimension = 0; dimension < dim; ++dimension)
+            if (dof_handler.get_cartesian_index(global_index)[dimension] == 0)
+              {
+                current_solution[global_index] =
+                  heat_data.boundary_conditions.values[dimension][0];
+              }
+            else if (dof_handler.get_cartesian_index(global_index)[dimension] ==
+                     heat_data.grid.n_dofs[dimension] - 1)
+              current_solution[global_index] =
+                heat_data.boundary_conditions.values[dimension][1];
+        }
+    }
+}
+
+template <int dim,
+          typename number,
+          typename la_vector_type,
+          typename la_matrix_type>
+la_vector_type
+i2phpp::HeatOperator<dim, number, la_vector_type, la_matrix_type>::
+  source_term_vector(number current_time) const
+{
+  la_vector_type source(heat_data.grid.n_global_dofs, 0.);
+  if (heat_data.source_max_energy == 0)
+    return source;
+
+#pragma omp parallel for default(none) shared(heat_data, current_time, source)
+  for (std::size_t i = 0; i < heat_data.grid.n_global_dofs; ++i)
+    source[i] = source_term(current_time, i);
+
+  return source;
+}
+
+template <int dim,
+          typename number,
+          typename la_vector_type,
+          typename la_matrix_type>
+number
+i2phpp::HeatOperator<dim, number, la_vector_type, la_matrix_type>::source_term(
+  const number      current_time,
+  const std::size_t index) const
+{
+  std::array<number, dim> location = dof_handler.get_physical_location(index);
+  return heat_data.source(current_time, location);
+}
+
+template <int dim,
+          typename number,
+          typename la_vector_type,
+          typename la_matrix_type>
+number
+i2phpp::HeatOperator<dim, number, la_vector_type, la_matrix_type>::
+  matrix_free_stencil(const std::size_t     index,
+                      const la_vector_type &solution) const
+{
+  std::array<std::size_t, dim> offset{};
+  offset[0] = 1;
+  for (std::size_t i = 1; i < dim; ++i)
+    {
+      offset[i] = offset[i - 1] * heat_data.grid.n_dofs[i - 1];
+    }
+
+  auto   local_indices = dof_handler.get_cartesian_index(index);
+  number result        = 0;
+  for (unsigned int dimension = 0; dimension < dim; ++dimension)
+    {
+      auto delta_grid_squared_inverse =
+        1. / (heat_data.grid.delta_grid[dimension] *
+              heat_data.grid.delta_grid[dimension]);
+      result += heat_data.thermal_diffusivity(
+                  dof_handler.get_physical_location(local_indices)) *
+                delta_grid_squared_inverse *
+                (solution[index - offset[dimension]] - 2. * solution[index] +
+                 solution[index + offset[dimension]]);
+
+      result +=
+        0.25 * delta_grid_squared_inverse *
+        (heat_data.thermal_diffusivity(
+           dof_handler.get_physical_location(index + offset[dimension])) -
+         heat_data.thermal_diffusivity(
+           dof_handler.get_physical_location(index - offset[dimension]))) *
+        (solution[index + offset[dimension]] -
+         solution[index - offset[dimension]]);
+    }
+  return result;
+}
+
+template <int dim,
+          typename number,
+          typename la_vector_type,
+          typename la_matrix_type>
+number
+i2phpp::HeatOperator<dim, number, la_vector_type, la_matrix_type>::
+  jacobi_update(const std::size_t     index,
+                const number          time,
+                const number          current_time_increment,
+                const la_vector_type &old_iter_vector,
+                const la_vector_type &rhs) const
+{
+  auto   local_indices = dof_handler.get_cartesian_index(index);
+  number kappa         = heat_data.thermal_diffusivity(
+    dof_handler.get_physical_location(local_indices));
+
+  // Compute K_ii spatial diagonal term
+  number K_ii = 0.0;
+  for (unsigned int dimension = 0; dimension < dim; ++dimension)
+    {
+      K_ii -= 2.0 * kappa /
+              (heat_data.grid.delta_grid[dimension] *
+               heat_data.grid.delta_grid[dimension]);
+    }
+
+  number A_ii  = 1.0 - current_time_increment * K_ii;
+  number K_x_i = matrix_free_stencil(index, old_iter_vector);
+  number A_x_i = old_iter_vector[index] - current_time_increment * K_x_i;
+
+  return old_iter_vector[index] + (rhs[index] - A_x_i) / A_ii;
+}
+
+template class i2phpp::
+  HeatOperator<3, double, i2phpp::LaVector<double>, i2phpp::LaMatrix<double>>;
+template class i2phpp::
+  HeatOperator<2, double, i2phpp::LaVector<double>, i2phpp::LaMatrix<double>>;
+template class i2phpp::
+  HeatOperator<1, double, i2phpp::LaVector<double>, i2phpp::LaMatrix<double>>;
+template class i2phpp::
+  HeatOperator<3, float, i2phpp::LaVector<float>, i2phpp::LaMatrix<float>>;
+template class i2phpp::
+  HeatOperator<2, float, i2phpp::LaVector<float>, i2phpp::LaMatrix<float>>;
+template class i2phpp::
+  HeatOperator<1, float, i2phpp::LaVector<float>, i2phpp::LaMatrix<float>>;
+
+
+
+
+
+LA_MATRIX.CPP
+
+#include <i2phpp/linear_algebra/la_matrix.hpp>
+#include <i2phpp/util/asserts.hpp>
+#include <omp.h>
+
+#include <utility>
+#include <vector>
+
+template <typename number>
+i2phpp::LaMatrix<number>::LaMatrix(const std::size_t n_rows,
+                                   const std::size_t n_cols,
+                                   const number      initial_value)
+  : data(n_rows, std::vector<number>(n_cols, initial_value))
+{}
+
+template <typename number>
+i2phpp::LaMatrix<number>
+i2phpp::LaMatrix<number>::identity(const std::size_t n)
+{
+  LaMatrix<number> mat(n, n, number{});
+  for (std::size_t idx = 0; idx < n; ++idx)
+    {
+      mat[idx, idx] = number(1.0);
+    }
+  return mat;
+}
+
+template <typename number>
+number &
+i2phpp::LaMatrix<number>::at(const std::size_t row_idx,
+                             const std::size_t col_idx)
+{
+  return data.at(row_idx).at(col_idx);
+}
+
+template <typename number>
+const number &
+i2phpp::LaMatrix<number>::at(const std::size_t row_idx,
+                             const std::size_t col_idx) const
+{
+  return data.at(row_idx).at(col_idx);
+}
+
+template <typename number>
+std::size_t
+i2phpp::LaMatrix<number>::rows() const
+{
+  return data.size();
+}
+
+template <typename number>
+std::size_t
+i2phpp::LaMatrix<number>::cols() const
+{
+  return data.empty() ? 0 : data[0].size();
+}
+
+template <typename number>
+std::pair<std::size_t, std::size_t>
+i2phpp::LaMatrix<number>::size() const noexcept
+{
+  if (data.empty())
+    {
+      return {0, 0};
+    }
+  else
+    {
+      return {data.size(), data[0].size()};
+    }
+}
+
+template <typename number>
+void
+i2phpp::LaMatrix<number>::resize(const std::size_t new_n_rows,
+                                 const std::size_t new_n_cols)
+{
+  data.resize(new_n_rows);
+  for (std::size_t row = 0; row < new_n_rows; ++row)
+    {
+      data[row].resize(new_n_cols);
+    }
+}
+
+template <typename number>
+number
+i2phpp::LaMatrix<number>::trace() const
+{
+  assert_debug(rows() == cols(), "Matrix must be square to compute trace.");
+
+  auto tr = number(0);
+
+  const std::size_t num_rows = rows();
+#pragma omp parallel for default(none) shared(num_rows) reduction(+ : tr)
+  for (std::size_t idx = 0; idx < num_rows; ++idx)
+    {
+      tr += (*this)[idx, idx];
+    }
+  return tr;
+}
+
+template <typename number>
+i2phpp::LaMatrix<number>
+i2phpp::LaMatrix<number>::transpose() const
+{
+  LaMatrix<number> transposed(cols(), rows());
+  for (std::size_t row_idx = 0; row_idx < rows(); ++row_idx)
+    for (std::size_t col_idx = 0; col_idx < cols(); ++col_idx)
+      transposed[col_idx, row_idx] = (*this)[row_idx, col_idx];
+  return transposed;
+}
+
+template <typename number>
+const number &
+i2phpp::LaMatrix<number>::operator[](const std::size_t row,
+                                     const std::size_t col) const
+{
+  return data[row][col];
+}
+
+template <typename number>
+number &
+i2phpp::LaMatrix<number>::operator[](const std::size_t row,
+                                     const std::size_t col)
+{
+  return data[row][col];
+}
+
+template <typename number>
+i2phpp::LaMatrix<number>
+i2phpp::LaMatrix<number>::operator+(const LaMatrix<number> &mat) const
+{
+  if (size() != mat.size())
+    throw std::invalid_argument("Matrix dimensions must match for addition.");
+
+  LaMatrix<number> result(rows(), cols(), number(0.0));
+
+  const std::size_t num_rows = rows();
+  const std::size_t num_cols = cols();
+  auto             &self     = *this;
+
+#pragma omp parallel for default(none) \
+  shared(self, mat, result, num_rows, num_cols) collapse(2)
+  for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t col_idx = 0; col_idx < num_cols; ++col_idx)
+      result[row_idx, col_idx] = self[row_idx, col_idx] + mat[row_idx, col_idx];
+
+  return result;
+}
+
+template <typename number>
+i2phpp::LaMatrix<number> &
+i2phpp::LaMatrix<number>::operator+=(const LaMatrix<number> &mat)
+{
+  assert_debug(size() == mat.size(),
+               "Matrix dimensions must match for addition.");
+
+  const std::size_t num_rows = rows();
+  const std::size_t num_cols = cols();
+  auto             &self     = *this;
+
+#pragma omp parallel for default(none) shared(self, mat, num_rows, num_cols) \
+  collapse(2)
+  for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t col_idx = 0; col_idx < num_cols; ++col_idx)
+      self[row_idx, col_idx] += mat[row_idx, col_idx];
+
+  return *this;
+}
+
+template <typename number>
+i2phpp::LaMatrix<number>
+i2phpp::LaMatrix<number>::operator-(const LaMatrix<number> &mat) const
+{
+  assert_debug(size() == mat.size(),
+               "Matrix dimensions must match for subtraction.");
+
+  LaMatrix<number>  result(rows(), cols(), number(0.0));
+  const std::size_t num_rows = rows();
+  const std::size_t num_cols = cols();
+  auto             &self     = *this;
+
+#pragma omp parallel for default(none) \
+  shared(self, mat, result, num_rows, num_cols) collapse(2)
+  for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t col_idx = 0; col_idx < num_cols; ++col_idx)
+      result[row_idx, col_idx] = self[row_idx, col_idx] - mat[row_idx, col_idx];
+
+  return result;
+}
+
+template <typename number>
+i2phpp::LaMatrix<number> &
+i2phpp::LaMatrix<number>::operator-=(const LaMatrix<number> &mat)
+{
+  assert_debug(size() == mat.size(),
+               "Matrix dimensions must match for subtraction.");
+  const std::size_t num_rows = rows();
+  const std::size_t num_cols = cols();
+  auto             &self     = *this;
+
+#pragma omp parallel for default(none) shared(self, mat, num_rows, num_cols) \
+  collapse(2)
+  for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t col_idx = 0; col_idx < num_cols; ++col_idx)
+      self[row_idx, col_idx] -= mat[row_idx, col_idx];
+  return *this;
+}
+
+template <typename number>
+i2phpp::LaMatrix<number>
+i2phpp::LaMatrix<number>::operator*(const LaMatrix<number> &mat) const
+{
+  assert_debug(cols() == mat.rows(),
+               "Dimension mismatch in matrix-matrix multiplication.");
+
+  LaMatrix<number> result(rows(), mat.cols(), number(0.0));
+
+  const std::size_t num_rows     = rows();
+  const std::size_t num_cols     = cols();
+  const std::size_t mat_num_cols = mat.cols();
+  auto             &self         = *this;
+
+#pragma omp parallel for default(none) \
+  shared(self, mat, result, num_rows, num_cols, mat_num_cols)
+  for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t idx = 0; idx < num_cols; ++idx)
+      for (std::size_t col_idx = 0; col_idx < mat_num_cols; ++col_idx)
+        result[row_idx, col_idx] += self[row_idx, idx] * mat[idx, col_idx];
+  return result;
+}
+
+template <typename number>
+i2phpp::LaVector<number>
+i2phpp::LaMatrix<number>::operator*(const LaVector<number> &vec) const
+{
+  assert_debug(cols() == vec.size(),
+               "Dimension mismatch in matrix-vector multiplication.");
+
+  LaVector<number> result(rows(), number(0.0));
+
+  const std::size_t num_rows = rows();
+  const std::size_t num_cols = cols();
+  auto             &self     = *this;
+
+#pragma omp parallel for default(none) \
+  shared(self, vec, result, num_rows, num_cols)
+  for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t idx = 0; idx < num_cols; ++idx)
+      result[row_idx] += self[row_idx, idx] * vec[idx];
+  return result;
+}
+
+template <typename number>
+i2phpp::LaMatrix<number>
+i2phpp::LaMatrix<number>::operator*(const number num) const
+{
+  LaMatrix<number> result(rows(), cols(), number(0.0));
+
+  const std::size_t num_rows = rows();
+  const std::size_t num_cols = cols();
+  auto             &self     = *this;
+
+#pragma omp parallel for default(none) \
+  shared(self, num, result, num_rows, num_cols) collapse(2)
+  for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t col_idx = 0; col_idx < num_cols; ++col_idx)
+      result[row_idx, col_idx] = self[row_idx, col_idx] * num;
+  return result;
+}
+
+template <typename number>
+i2phpp::LaMatrix<number> &
+i2phpp::LaMatrix<number>::operator*=(const number num)
+{
+  const std::size_t num_rows = rows();
+  const std::size_t num_cols = cols();
+  auto             &self     = *this;
+#pragma omp parallel for default(none) shared(self, num, num_rows, num_cols) \
+  collapse(2)
+  for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t col_idx = 0; col_idx < num_cols; ++col_idx)
+      self[row_idx, col_idx] *= num;
+
+  return *this;
+}
+
+template <typename number>
+i2phpp::LaMatrix<number>
+i2phpp::LaMatrix<number>::operator/(const number num) const
+{
+  LaMatrix<number>  result(rows(), cols(), number(0.0));
+  const std::size_t num_rows = rows();
+  const std::size_t num_cols = cols();
+  auto             &self     = *this;
+#pragma omp parallel for default(none) \
+  shared(self, num, result, num_rows, num_cols) collapse(2)
+  for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t col_idx = 0; col_idx < num_cols; ++col_idx)
+      result[row_idx, col_idx] = self[row_idx, col_idx] / num;
+  return result;
+}
+
+template <typename number>
+i2phpp::LaMatrix<number> &
+i2phpp::LaMatrix<number>::operator/=(const number num)
+{
+  const std::size_t num_rows = rows();
+  const std::size_t num_cols = cols();
+  auto             &self     = *this;
+#pragma omp parallel for default(none) shared(self, num, num_rows, num_cols) \
+  collapse(2)
+  for (std::size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+    for (std::size_t col_idx = 0; col_idx < num_cols; ++col_idx)
+      self[row_idx, col_idx] /= num;
+
+  return *this;
+}
+
+template <typename number>
+void
+i2phpp::LaMatrix<number>::apply(const std::function<number(number)> &func)
+{
+  for (std::size_t row_idx = 0; row_idx < rows(); ++row_idx)
+    for (std::size_t col_idx = 0; col_idx < cols(); ++col_idx)
+      (*this)[row_idx, col_idx] = func((*this)[row_idx, col_idx]);
+}
+
+template <typename number>
+void
+i2phpp::LaMatrix<number>::swap(LaMatrix<number> &other)
+{
+  data.swap(other.data);
+}
+
+template class i2phpp::LaMatrix<double>;
+template class i2phpp::LaMatrix<float>;
+template class i2phpp::LaMatrix<int>;
+
+
+
+
+LA_VECTOR.CPP
+
+#include <i2phpp/linear_algebra/la_vector.hpp>
+#include <i2phpp/util/asserts.hpp>
+#include <omp.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <vector>
+
+template <typename number>
+i2phpp::LaVector<number>::LaVector(const std::size_t size,
+                                   const number      initial_value)
+  : data(size, initial_value)
+{}
+
+template <typename number>
+i2phpp::LaVector<number>::LaVector(const std::vector<number> &container)
+  : data(container)
+{}
+
+template <typename number>
+number &
+i2phpp::LaVector<number>::at(const std::size_t index)
+{
+  return data.at(index);
+}
+
+template <typename number>
+const number &
+i2phpp::LaVector<number>::at(const std::size_t index) const
+{
+  return data.at(index);
+}
+
+template <typename number>
+std::size_t
+i2phpp::LaVector<number>::size() const noexcept
+{
+  return data.size();
+}
+
+template <typename number>
+void
+i2phpp::LaVector<number>::resize(const std::size_t new_size,
+                                 const number      init_value)
+{
+  data.resize(new_size, init_value);
+}
+
+template <typename number>
+number
+i2phpp::LaVector<number>::dot_product(const LaVector<number> &other) const
+{
+  assert_debug(size() == other.size(),
+               "Vector dimensions must match for dot product.");
+
+  number result = number(0.0);
+  const std::size_t n = size();
+  auto &self = *this;
+
+#pragma omp parallel for default(none) shared(self, other, n) reduction(+ : result)
+  for (std::size_t i = 0; i < n; ++i)
+    result += self[i] * other[i];
+  return result;
+}
+
+template <typename number>
+typename std::vector<number>::iterator
+i2phpp::LaVector<number>::begin()
+{
+  return data.begin();
+}
+
+template <typename number>
+typename std::vector<number>::const_iterator
+i2phpp::LaVector<number>::begin() const
+{
+  return data.begin();
+}
+
+template <typename number>
+typename std::vector<number>::iterator
+i2phpp::LaVector<number>::end()
+{
+  return data.end();
+}
+
+template <typename number>
+typename std::vector<number>::const_iterator
+i2phpp::LaVector<number>::end() const
+{
+  return data.end();
+}
+
+template <typename number>
+const number &
+i2phpp::LaVector<number>::operator[](const std::size_t index) const
+{
+  return data[index];
+}
+
+template <typename number>
+number &
+i2phpp::LaVector<number>::operator[](const std::size_t index)
+{
+  return data[index];
+}
+
+template <typename number>
+void
+i2phpp::LaVector<number>::set_all(const number value)
+{
+  std::for_each(data.begin(), data.end(), [value](number &n) { n = value; });
+}
+
+template <typename number>
+i2phpp::LaVector<number>
+i2phpp::LaVector<number>::operator+(const LaVector<number> &vec) const
+{
+  assert_debug(size() == vec.size(), "Vector dimensions must be the same.");
+
+  const std::size_t n = size();
+  auto &self = *this;
+  LaVector<number> result(n);
+
+#pragma omp parallel for default(none) shared(self, vec, result, n)
+  for (std::size_t i = 0; i < n; ++i)
+    result[i] = self[i] + vec[i];
+  return result;
+}
+
+template <typename number>
+i2phpp::LaVector<number> &
+i2phpp::LaVector<number>::operator+=(const LaVector<number> &vec)
+{
+  assert_debug(size() == vec.size(), "Vector dimensions must be the same.");
+
+  const std::size_t n = size();
+  auto &self = *this;
+
+#pragma omp parallel for default(none) shared(self, vec, n)
+  for (std::size_t i = 0; i < n; ++i)
+    self[i] += vec[i];
+
+  return *this;
+}
+
+template <typename number>
+i2phpp::LaVector<number>
+i2phpp::LaVector<number>::operator-(const LaVector<number> &vec) const
+{
+  assert_debug(size() == vec.size(), "Vector dimensions must be the same.");
+
+  const std::size_t n = size();
+  auto &self = *this;
+  LaVector<number> result(n);
+
+#pragma omp parallel for default(none) shared(self, vec, result, n)
+  for (std::size_t i = 0; i < n; ++i)
+    result[i] = self[i] - vec[i];
+  return result;
+}
+
+template <typename number>
+i2phpp::LaVector<number> &
+i2phpp::LaVector<number>::operator-=(const LaVector<number> &vec)
+{
+  assert_debug(size() == vec.size(), "Vector dimensions must be the same.");
+
+  const std::size_t n = size();
+  auto &self = *this;
+
+#pragma omp parallel for default(none) shared(self, vec, n)
+  for (std::size_t i = 0; i < n; ++i)
+    self[i] -= vec[i];
+
+  return *this;
+}
+
+template <typename number>
+i2phpp::LaVector<number>
+i2phpp::LaVector<number>::operator*(const number num) const
+{
+  const std::size_t n = size();
+  auto &self = *this;
+  LaVector<number> result(n);
+
+#pragma omp parallel for default(none) shared(self, num, result, n)
+  for (std::size_t i = 0; i < n; ++i)
+    result[i] = num * self[i];
+  return result;
+}
+
+template <typename number>
+i2phpp::LaVector<number> &
+i2phpp::LaVector<number>::operator*=(const number num)
+{
+  const std::size_t n = size();
+  auto &self = *this;
+
+#pragma omp parallel for default(none) shared(self, num, n)
+  for (std::size_t i = 0; i < n; ++i)
+    self[i] *= num;
+  return *this;
+}
+
+template <typename number>
+i2phpp::LaVector<number>
+i2phpp::LaVector<number>::operator/(const number num) const
+{
+  const std::size_t n = size();
+  auto &self = *this;
+  LaVector<number> result(n);
+
+#pragma omp parallel for default(none) shared(self, num, result, n)
+  for (std::size_t i = 0; i < n; ++i)
+    result[i] = self[i] / num;
+  return result;
+}
+
+template <typename number>
+i2phpp::LaVector<number> &
+i2phpp::LaVector<number>::operator/=(const number num)
+{
+  const std::size_t n = size();
+  auto &self = *this;
+
+#pragma omp parallel for default(none) shared(self, num, n)
+  for (std::size_t i = 0; i < n; ++i)
+    self[i] /= num;
+  return *this;
+}
+
+template <typename number>
+bool
+i2phpp::LaVector<number>::operator==(const LaVector<number> &other) const
+{
+  return size() == other.size() &&
+         std::equal(data.begin(), data.end(), other.begin());
+}
+
+template <typename number>
+bool
+i2phpp::LaVector<number>::operator!=(const LaVector<number> &other) const
+{
+  return !(*this == other);
+}
+
+template <typename number>
+void
+i2phpp::LaVector<number>::swap(LaVector<number> &other)
+{
+  data.swap(other.data);
+}
+
+template <typename number>
+number
+i2phpp::LaVector<number>::l2_norm_squared() const
+{
+  number sum = number(0.0);
+  const std::size_t n = size();
+  auto &self = *this;
+
+#pragma omp parallel for default(none) shared(self, n) reduction(+ : sum)
+  for (std::size_t i = 0; i < n; ++i)
+    sum += self[i] * self[i];
+  return sum;
+}
+
+template <typename number>
+number
+i2phpp::LaVector<number>::norm_l2() const
+{
+  return std::sqrt(l2_norm_squared());
+}
+
+template <typename number>
+number
+i2phpp::LaVector<number>::norm_l1() const
+{
+  number sum = number(0.0);
+  const std::size_t n = size();
+  auto &self = *this;
+
+#pragma omp parallel for default(none) shared(self, n) reduction(+ : sum)
+  for (std::size_t i = 0; i < n; ++i)
+    sum += std::abs(self[i]);
+  return sum;
+}
+
+template <typename number>
+number
+i2phpp::LaVector<number>::norm_linf() const
+{
+  number max_abs = number(0.0);
+  const std::size_t n = size();
+  auto &self = *this;
+
+#pragma omp parallel for default(none) shared(self, n) reduction(max : max_abs)
+  for (std::size_t i = 0; i < n; ++i)
+    {
+      const number a = std::abs(self[i]);
+      if (a > max_abs)
+        max_abs = a;
+    }
+  return max_abs;
+}
+
+template <typename number>
+i2phpp::LaVector<number>
+i2phpp::LaVector<number>::schur_product(const LaVector<number> &other) const
+{
+  assert_debug(size() == other.size(), "Vector dimensions must be the same.");
+
+  const std::size_t n = size();
+  auto &self = *this;
+  LaVector<number> result(n);
+
+#pragma omp parallel for default(none) shared(self, other, result, n)
+  for (std::size_t i = 0; i < n; ++i)
+    result[i] = self[i] * other[i];
+  return result;
+}
+
+template <typename number>
+void
+i2phpp::LaVector<number>::apply(const std::function<number(number)> &func)
+{
+  for (auto &value : data)
+    value = func(value);
+}
+
+template <typename number>
+void
+i2phpp::LaVector<number>::normalize()
+{
+  const number norm = norm_l2();
+  assert_release(norm != number{}, "Cannot normalize a zero vector.");
+  for (auto &value : data)
+    value /= norm;
+}
+
+template class i2phpp::LaVector<double>;
+template class i2phpp::LaVector<float>;
+template class i2phpp::LaVector<int>;
+
+
+
+
+HEAT_OPERATOR.hpp
+
+
+#pragma once
+
+#include <i2phpp/heat_equation/heat_data.hpp>
+#include <i2phpp/heat_equation/heat_operator.hpp>
+#include <i2phpp/util/dof_handler.hpp>
+
+namespace i2phpp
+{
+  /**
+   * Sets up the system matrix corresponding to the finite difference
+   * discretization of the second spatial derivative in the heat equation.
+   *
+   * This function constructs a matrix (@param system_matrix) that represents
+   * the discrete approximation of the heat equation, independent of the
+   * temperature field. The matrix can be later applied to a temperature vector
+   * during time stepping.
+   *
+   * @param heat_data Relevant data used to setup the system matrix.
+   * @param dof_handler The used dof handler managing the indexing and location
+   * of the degrees of freedom.
+   * @param system_matrix The location in which the computed system matrix is +
+   * stored.
+   */
+  template <int dim, typename number, typename la_matrix_type>
+  void
+  setup_finite_difference_heat_equation_system_matrix(
+    const HeatData<dim, number>   &heat_data,
+    const DoFHandler<dim, number> &dof_handler,
+    la_matrix_type                &system_matrix);
+
+
+  template <int dim,
+            typename number,
+            typename la_vector_type,
+            typename la_matrix_type>
+  class HeatOperator
+  {
+  public:
+    /**
+     * Constructor that computes the system matrix and initializes the solution
+     * vector with the initial conditions. The initial solution is then adjusted
+     * to satisfy the boundary conditions.
+     *
+     * @param heat_data Data required to solve the heat equation.
+     * @param dof_handler Helper funcctions for DoF indexing.
+     */
+    HeatOperator(const HeatData<dim, number>   &heat_data,
+                 const DoFHandler<dim, number> &dof_handler);
+
+    /**
+     * Advances the solution by one time step, from T^(n) to T^(n+1), using the
+     * explicit Euler scheme. The solution at the new time step is computed and
+     * stored internally, replacing the previous result.
+     *
+     * @param current_time Current simulation time at t^(n+1)
+     * @param current_time_increment The time step size, dt = t^(n+1) - t^(n).
+     */
+    void
+    advance_time_step(number current_time, number current_time_increment);
+
+    /**
+     * @brief Returns a constant reference to the current solution stored in
+     * the solver.
+     */
+    const la_vector_type &
+    get_current_solution() const;
+
+    /**
+     * @brief Returns a modifiable reference to the current solution stored in
+     * the solver.
+     */
+    la_vector_type &
+    get_current_solution();
+
+  private:
+    /**
+     * Applies the boundary conditions to the solution vector. The boundary
+     * condition values are retrieved from the HeatData struct, which is stored
+     * as a reference by the class.
+     */
+    void
+    apply_boundary_conditions();
+
+    /**
+     * Sets the initial condition by updating the current solution vector
+     * accordingly.
+     */
+    void
+    set_initial_conditions();
+
+    /**
+     * @brief Computes the thermal source term at a given time for the point
+     * corresponding to a specific array index.
+     *
+     * @param current_time The current simulation time.
+     * @param index The global index of the point at which the source term is
+     * evaluated.
+     *
+     * @return The computed source term value at the given index and time.
+     */
+    number
+    source_term(const number current_time, const std::size_t index) const;
+
+    /**
+     * @brief Computes the thermal source term at a given time for all degrees of
+     * freedom.
+     *
+     * This function evaluates the source term at each index in the domain and
+     * returns the results as a vector.
+     *
+     * @param current_time The current simulation time.
+     *
+     * @return A vector containing the source term values at all indices.
+     */
+    la_vector_type
+    source_term_vector(number current_time) const;
+
+    /**
+     * @brief Computes the finite difference stencil for the heat equation at a
+     * given global index.
+     *
+     * This function evaluates the discrete Laplace operator while accounting
+     * for spatially varying thermal diffusivity. The computation is performed
+     * in a matrix-free manner, operating directly on the solution vector
+     * without assembling a global matrix.
+     *
+     * @param index The global degree of freedom (DoF) index at which the stencil is evaluated.
+     * @param solution The solution vector on which the stencil is applied.
+     *
+     * @return The computed stencil value at the specified index.
+     */
+    number
+    matrix_free_stencil(const std::size_t     index,
+                        const la_vector_type &solution) const;
+
+    number
+    jacobi_update(const std::size_t     index,
+                  const number          time,
+                  const number          current_time_increment,
+                  const la_vector_type &old_iter_vector,
+                  const la_vector_type &rhs) const;
+
+
+
+    /// System matrix representing the discretized second spatial derivative
+    /// (Laplacian) for the heat equation.
+    la_matrix_type system_matrix;
+
+    /// Heat data containing all necessary parameters and properties for solving
+    /// the heat equation.
+    const HeatData<dim, number> heat_data;
+
+    /// Vector holding the current solution (temperature field) at the current
+    /// time t^(n+1)AS.
+    la_vector_type current_solution;
+
+    /// Vector holding the old solution (temperature field) at the previous time
+    /// t^(n).
+    la_vector_type old_solution;
+
+    /// Reference to the DoF handler that manages degree-of-freedom indexing.
+    const DoFHandler<dim, number> &dof_handler;
+  };
+} // namespace i2phpp
+
+template <int dim, typename number, typename la_matrix_type>
+void
+i2phpp::setup_finite_difference_heat_equation_system_matrix(
+  const HeatData<dim, number>   &heat_data,
+  const DoFHandler<dim, number> &dof_handler,
+  la_matrix_type                &system_matrix)
+{
+  std::array<std::size_t, dim> offset{};
+  offset[0] = 1;
+  for (std::size_t i = 1; i < dim; ++i)
+    {
+      offset[i] = offset[i - 1] * heat_data.grid.n_dofs[i - 1];
+    }
+
+  system_matrix.resize(heat_data.grid.n_global_dofs,
+                       heat_data.grid.n_global_dofs);
+
+#pragma omp parallel for default(none) \
+  shared(heat_data, dof_handler, system_matrix, offset) schedule(static)
+  for (std::size_t row_idx = 0; row_idx < heat_data.grid.n_global_dofs;
+       ++row_idx)
+    {
+      if (!dof_handler.at_boundary(row_idx))
+        {
+          auto local_indices = dof_handler.get_cartesian_index(row_idx);
+          for (unsigned int dimension = 0; dimension < dim; ++dimension)
+            {
+              auto thermal_diffusivity_center = heat_data.thermal_diffusivity(
+                dof_handler.get_physical_location(local_indices));
+              system_matrix[row_idx, row_idx] -=
+                thermal_diffusivity_center * 2. /
+                (heat_data.grid.delta_grid[dimension] *
+                 heat_data.grid.delta_grid[dimension]);
+
+              auto thermal_diffusivity_gradient =
+                0.5 /
+                (heat_data.grid.delta_grid[dimension] *
+                 heat_data.grid.delta_grid[dimension]) *
+                (heat_data.thermal_diffusivity(
+                   dof_handler.get_physical_location(row_idx +
+                                                     offset[dimension])) -
+                 heat_data.thermal_diffusivity(
+                   dof_handler.get_physical_location(row_idx -
+                                                     offset[dimension])));
+
+              system_matrix[row_idx, row_idx - offset[dimension]] =
+                thermal_diffusivity_center * 1.0 /
+                  (heat_data.grid.delta_grid[dimension] *
+                   heat_data.grid.delta_grid[dimension]) -
+                0.5 * thermal_diffusivity_gradient;
+
+              system_matrix[row_idx, row_idx + offset[dimension]] =
+                heat_data.thermal_diffusivity(
+                  dof_handler.get_physical_location(local_indices)) *
+                  1.0 /
+                  (heat_data.grid.delta_grid[dimension] *
+                   heat_data.grid.delta_grid[dimension]) +
+                0.5 * thermal_diffusivity_gradient;
+            }
+        }
+    }
+}
+
+
+
+
+LA_MATRIX.hpp
+
+/**
+ * @brief Represents a mathematical matrix for linear algebra operations.
+ *
+ * This class provides the foundation for performing standard matrix operations
+ * such as addition, multiplication and more. It can be extended  to support
+ * advanced functionality as needed.
+ */
+
+#pragma once
+
+#include <i2phpp/linear_algebra/la_vector.hpp>
+#include <i2phpp/util/asserts.hpp>
+
+#include <utility>
+#include <vector>
+
+namespace i2phpp
+{
+  template <typename number>
+  class LaMatrix
+  {
+  public:
+    /**
+     * Default constructor. Constructs an empty 0x0 matrix.
+     */
+    LaMatrix() = default;
+
+    /**
+     * Constructs a matrix with the specified dimensions and initializes all
+     * entries to the given value.
+     *
+     * @param n_rows Number of rows in the matrix.
+     * @param n_cols Number of columns in the matrix.
+     * @param initial_value Value to assign to each element in the matrix.
+     */
+    LaMatrix(std::size_t n_rows,
+             std::size_t n_cols,
+             number      initial_value = number(0));
+
+    /**
+     * Creates an identity matrix of size n x n.
+     *
+     * @param n The size of the identity matrix (number of rows and columns).
+     * @return An n x n identity matrix.
+     */
+    static LaMatrix<number>
+    identity(std::size_t n);
+
+    /**
+     * Returns the value at the specified matrix index (row_idx, col_idx).
+     * Performs bounds checking and throws on invalid indices. This prevents
+     * segmentation faults at the cost of additional runtime overhead.
+     *
+     * @param row_idx Row index.
+     * @param col_idx Column index.
+     *
+     * @return Value at the specified index.
+     */
+    number &
+    at(std::size_t row_idx, std::size_t col_idx);
+
+    /**
+     * Same as above but returns a const reference.
+     */
+    const number &
+    at(std::size_t row_idx, std::size_t col_idx) const;
+
+    /**
+     * Returns the number of rows in the matrix.
+     */
+    std::size_t
+    rows() const;
+
+    /**
+     * Returns the number of columns in the matrix.
+     */
+    std::size_t
+    cols() const;
+
+    /**
+     * Returns the dimensions of the matrix.
+     *
+     * @return A pair (rows, columns) representing the matrix size.
+     */
+    [[nodiscard]] std::pair<std::size_t, std::size_t>
+    size() const noexcept;
+
+    /**
+     * Resizes the matrix to the specified number of rows and columns. Existing
+     * data is preserved where possible. If the new size is larger, new elements
+     * are initialized with zero. If the new size is smaller,  existing elements
+     * which are out of bounds for the new size are discarded.
+     *
+     * @param new_n_rows New number of rows.
+     * @param new_n_cols New number of columns.
+     */
+    void
+    resize(std::size_t new_n_rows, std::size_t new_n_cols);
+
+    /**
+     * Computes and returns the trace of the matrix (sum of diagonal elements).
+     * Throws an exception if the matrix is not square.
+     *
+     * @return The trace of the matrix.
+     */
+    number
+    trace() const;
+
+    /**
+     * Computes the transpose of the matrix.
+     *
+     * @return The transpose of the matrix.
+     */
+    LaMatrix
+    transpose() const;
+
+    /**
+     * Returns a const reference to the value at the specified index.
+     *
+     * @param row Row index.
+     * @param col Column index.
+     *
+     * @return Value at the specified index.
+     */
+    const number &
+    operator[](std::size_t row, std::size_t col) const;
+
+    /**
+     * Returns a writable reference to the value at the specified index.
+     *
+     * @param row Row index.
+     * @param col Column index.
+     *
+     * @return Reference to the value at the specified index.
+     */
+    number &
+    operator[](std::size_t row, std::size_t col);
+
+    /**
+     * Returns a new matrix representing the element-wise sum of this matrix
+     * and the given matrix.
+     *
+     * @param mat Matrix to add.
+     *
+     * @return Sum of the two matrices.
+     */
+    LaMatrix<number>
+    operator+(const LaMatrix<number> &mat) const;
+
+    /**
+     * Performs in-place element-wise addition with the given matrix.
+     *
+     * @param mat Matrix to add.
+     */
+    LaMatrix<number> &
+    operator+=(const LaMatrix<number> &mat);
+
+    /**
+     * Returns a new matrix representing the element-wise difference between
+     * this matrix and the given matrix.
+     *
+     * @param mat Matrix to subtract.
+     *
+     * @return Resulting matrix after subtraction.
+     */
+    LaMatrix<number>
+    operator-(const LaMatrix<number> &mat) const;
+
+    /**
+     * Performs in-place element-wise subtraction with the given matrix.
+     *
+     * @param mat Matrix to subtract.
+     */
+    LaMatrix<number> &
+    operator-=(const LaMatrix<number> &mat);
+
+    /**
+     * Returns the matrix product of this matrix and the given matrix.
+     *
+     * @param mat Matrix to multiply with.
+     *
+     * @return Resulting matrix after multiplication.
+     */
+    LaMatrix<number>
+    operator*(const LaMatrix<number> &mat) const;
+
+    /**
+     * Returns the result of multiplying this matrix with the given vector.
+     *
+     * @param vec Vector to multiply with.
+     *
+     * @return Resulting vector.
+     */
+    LaVector<number>
+    operator*(const LaVector<number> &vec) const;
+
+    /**
+     * Returns a new matrix resulting from scalar multiplication.
+     *
+     * @param num Scalar multiplier.
+     *
+     * @return Scaled matrix.
+     */
+    LaMatrix<number>
+    operator*(number num) const;
+
+    /**
+     * Performs in-place scalar multiplication on the matrix.
+     *
+     * @param num Scalar multiplier.
+     */
+    LaMatrix<number> &
+    operator*=(number num);
+
+    /**
+     * Returns a new matrix resulting from scalar division.
+     *
+     * @param num Scalar divisor.
+     *
+     * @return Scaled matrix.
+     */
+    LaMatrix<number>
+    operator/(number num) const;
+
+    /**
+     * Performs in-place scalar division on the matrix.
+     *
+     * @param num Scalar divisor.
+     */
+    LaMatrix<number> &
+    operator/=(number num);
+
+    /**
+     * Applies the given function to each element of the matrix, modifying the
+     * matrix in-place.
+     *
+     * @param func The function to apply to each element. It should take a number as
+     * input and return a which represents the transformed value replacing the
+     * original value in the matrix.
+     */
+    void
+    apply(const std::function<number(number)> &func);
+
+    /**
+     * @brief Swaps the data of this matrix with another matrix using the swap
+     * function of the underlying data structure.
+     *
+     * @param other The LaMatrix object whose data is to be swapped with this
+     * object.
+     */
+    void
+    swap(LaMatrix<number> &other);
+
+  private:
+    /// Internal storage for the matrix elements.
+    std::vector<std::vector<number>> data{};
+  };
+} // namespace i2phpp
+
+
+
+LA_VECTOR.hpp
+
+/**
+ * @file la_vector.h
+ * @brief Represents a mathematical vector for use in linear algebra operations.
+ *
+ * This class models a one-dimensional array of numerical values and supports
+ * operations such as dot product, scaling and more. It is designed to work
+ * seamlessly with matrix operations and can be extended to support additional
+ * vector-specific functionality.
+ */
+
+#pragma once
+
+#include <i2phpp/util/asserts.hpp>
+
+#include <functional>
+#include <vector>
+
+
+
+namespace i2phpp
+{
+  /**
+   * @brief Represents a mathematical vector for linear algebra operations.
+   *
+   * @tparam number The numerical type of the vector elements (e.g., float,double).
+   * @tparam N The vectorization width.
+   */
+  template <typename number>
+  class LaVector
+  {
+  public:
+    /**
+     * Default constructor, initializes an empty vector.
+     */
+    LaVector() = default;
+
+    /**
+     * Constructor that creates a vector with @param size elements and
+     * initializes all elements with the value of @param initial_value.
+     *
+     * @param size The number of elements in the vector.
+     * @param initial_value The value to initialize each element with.
+     */
+    explicit LaVector(std::size_t size, number initial_value = number(0.));
+
+    /**
+     * Constructor that initializes the vector with the values from the provided
+     * @param container.
+     *
+     * @param container A std::vector containing the values to initialize the
+     * vector.
+     */
+    explicit LaVector(const std::vector<number> &container);
+
+    /**
+     * Returns the value at the specified @param index in the vector, checking
+     * whether the index is within the valid range.
+     *
+     * @param index The index of the element to access.
+     * @return The value at the specified index.
+     */
+    number &
+    at(std::size_t index);
+
+    /**
+     * As above but returns a const reference.
+     */
+    const number &
+    at(std::size_t index) const;
+
+    /**
+     * Returns the size of the vector (i.e. the number of elements it contains).
+     *
+     * @return The size of the vector.
+     */
+    [[nodiscard]] std::size_t
+    size() const noexcept;
+
+    /**
+     * Resizes the vector to a new size (@param new_size). Existing elements are
+     * preserved, and new elements are initialized with @param init_value.
+     *
+     * @param new_size The new size of the vector.
+     * @param init_value The value to initialize the new elements with.
+     */
+    void
+    resize(std::size_t new_size, number init_value = number(0.0));
+
+    /**
+     * Returns the dot product of the current vector and the provided
+     * @param other vector.
+     *
+     * @param other The vector to compute the dot product with.
+     * @return The dot product of the two vectors.
+     */
+    number
+    dot_product(const LaVector<number> &other) const;
+
+    /**
+     * Returns an iterator pointing to the first element in the vector.
+     *
+     * @return An iterator to the first element.
+     */
+    typename std::vector<number>::iterator
+    begin();
+
+    /**
+     * Const version of the above iterator.
+     */
+    typename std::vector<number>::const_iterator
+    begin() const;
+
+    /**
+     * Returns an iterator pointing to one element after the last element in the
+     * vector.
+     *
+     * @return An iterator to one element after the last element.
+     */
+    typename std::vector<number>::iterator
+    end();
+
+    /**
+     * Const version of the above iterator.
+     */
+    typename std::vector<number>::const_iterator
+    end() const;
+
+    /**
+     * Returns a const reference of the value at the specified @param index in the vector.
+     *
+     * @param index The index of the element to access.
+     * @return A const reference to the value at the specified index.
+     */
+    const number &
+    operator[](std::size_t index) const;
+
+    /**
+     * Returns a writable reference to the value at the specified @param index
+     * in the vector.
+     *
+     * @param index The index of the element to access.
+     * @return A reference to the value at the specified index.
+     */
+    number &
+    operator[](std::size_t index);
+
+    /**
+     * Sets all values in the vector to the specified parameter.
+     *
+     * @param value Value to which the vector elements are set.
+     */
+    void
+    set_all(number value);
+
+    /**
+     * Adds the given vector @param vec to the current vector and returns the
+     * resulting vector.
+     *
+     * @param vec The vector to add.
+     * @return The sum of the current vector and @param vec.
+     */
+    LaVector<number>
+    operator+(const LaVector<number> &vec) const;
+
+    /**
+     * Adds the given vector @param vec to the current vector, modifying the
+     * current vector.
+     *
+     * @param vec The vector to add.
+     */
+    LaVector<number> &
+    operator+=(const LaVector<number> &vec);
+
+    /**
+     * Subtracts the given vector @param vec from the current vector and returns
+     * the resulting vector.
+     *
+     * @param vec The vector to subtract.
+     * @return The difference between the current vector and @param vec.
+     */
+    LaVector<number>
+    operator-(const LaVector<number> &vec) const;
+
+    /**
+     * Subtracts the given vector @param vec from the current vector, modifying
+     * the current vector.
+     *
+     * @param vec The vector to subtract.
+     */
+    LaVector<number> &
+    operator-=(const LaVector<number> &vec);
+
+    /**
+     * Multiplies each element of the current vector by the scalar @param num
+     * and returns the resulting vector.
+     *
+     * @param num The scalar to multiply with.
+     * @return The scaled vector.
+     */
+    LaVector<number>
+    operator*(number num) const;
+
+    /**
+     * Multiplies each element of the current vector by the scalar @param num
+     * modifying the current vector.
+     *
+     * @param num The scalar to multiply with.
+     */
+    LaVector<number> &
+    operator*=(number num);
+
+    /**
+     * Divides each element of the current vector by the scalar @param num
+     * and returns the resulting vector.
+     *
+     * @param num The scalar to multiply with.
+     * @return The scaled vector.
+     */
+    LaVector<number>
+    operator/(number num) const;
+
+    /**
+     * Divides each element of the current vector by the scalar @param num
+     * modifying the current vector.
+     *
+     * @param num The scalar to multiply with.
+     */
+    LaVector<number> &
+    operator/=(number num);
+
+    /**
+     * Check if two vectors are equal. This is the case if they have the same
+     * dimensions and all corresponding elements are equal.
+     *
+     * @param other The vector to compare with.
+     * @return True if the vectors are equal, false otherwise.
+     */
+    bool
+    operator==(const LaVector<number> &other) const;
+
+    /**
+     * Check if two vectors are not equal. This is the case if they have
+     * different dimensions or at least one pair of corresponding elements are
+     * not equal.
+     *
+     * @param other The vector to compare with.
+     * @return True if the vectors are not equal, false otherwise.
+     */
+    bool
+    operator!=(const LaVector<number> &other) const;
+
+    /**
+     * @brief Swaps the data of this vector with another vector using the swap
+     * function of the underlying data structure.
+     *
+     * @param other The LaVector object whose data is to be swapped with this
+     * object.
+     */
+    void
+    swap(LaVector<number> &other);
+
+    /**
+     * Computes the square of the L2 norm of the vector.
+     *
+     * @return The square of the L2 norm.
+     */
+    number
+    l2_norm_squared() const;
+
+    /**
+     * Computes the L2 norm of the vector.
+     *
+     * @return The L2 norm.
+     */
+    number
+    norm_l2() const;
+
+    /**
+     * Computes the L1 norm of the vector.
+     *
+     * @return The L1 norm.
+     */
+    number
+    norm_l1() const;
+
+    /**
+     * Computes the L-infinity norm of the vector.
+     *
+     * @return The L-infinity norm.
+     */
+    number
+    norm_linf() const;
+
+    /**
+     * Computes the Schur (element-wise) product of two vectors.
+     *
+     * @param other The vector to multiply with.
+     * @return The Schur product.
+     */
+    LaVector<number>
+    schur_product(const LaVector<number> &other) const;
+
+    /**
+     * Applies the given function to each element of the vector, modifying the
+     * vector in-place.
+     *
+     * @param func The function to apply to each element. It should take a number as
+     * input and return a which represents the transformed value replacing the
+     * original value in the vector.
+     */
+    void
+    apply(const std::function<number(number)> &func);
+
+    /**
+     * Normalizes the vector in-place, making its L2 norm equal to 1.
+     */
+    void
+    normalize();
+
+    /**
+     * Get the underlying vector. This function is not intended to be used in
+     * the course but only required for plotting.
+     */
+    const std::vector<number> &
+    get_data() const
+    {
+      return data;
+    }
+
+  private:
+    /// Internal storage for the vector elements.
+    std::vector<number> data{};
+  };
+} // namespace i2phpp
+
+
+
+
+
+THREAD_POOL.hpp
+
+#pragma once
+
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <stdexcept>
+#include <thread>
+#include <utility>
+#include <vector>
+
+class ThreadPool
+{
+public:
+  /**
+   * @brief Constructs a thread pool with the specified number of threads.
+   *
+   * @param num_threads Number of worker threads to create. Defaults to hardware
+   * concurrency.
+   * @throws std::invalid_argument if num_threads is zero.
+   */
+  explicit ThreadPool(
+    const std::size_t num_threads = std::thread::hardware_concurrency());
+
+  ThreadPool(const ThreadPool &) = delete;
+
+  ThreadPool &
+  operator=(const ThreadPool &) = delete;
+
+  ThreadPool(ThreadPool &&) = delete;
+
+  ThreadPool &
+  operator=(ThreadPool &&) = delete;
+
+  /**
+   * @brief Destructor. Waits for all threads to finish and cleans up resources.
+   */
+  ~ThreadPool() noexcept;
+
+  /**
+   * @brief Enqueues a job to be executed by the thread pool.
+   *
+   * @param job A function object to execute.
+   */
+  void
+  enqueue(std::function<void()> job);
+
+  /**
+   * @brief Blocks until all enqueued jobs have been processed.
+   */
+  void
+  wait_for_all();
+
+private:
+  /// Worker threads that process jobs from the queue.
+  std::vector<std::thread> workers;
+
+  /// Queue of jobs to be executed.
+  std::queue<std::function<void()>> jobs;
+
+  /// Mutex for synchronizing access to the job queue.
+  std::mutex queue_mutex;
+
+  /// Condition variable to signal job availability.
+  std::condition_variable queue_condition;
+
+  /// Condition variable to signal completion of all jobs.
+  std::condition_variable work_done_condition;
+
+  /// Counter for currently active jobs.
+  std::size_t active_jobs = 0;
+
+  /// Flag to indicate the thread pool is stopping.
+  bool stop_thread_pool = false;
+};
+
+
+inline ThreadPool::ThreadPool(const std::size_t num_threads)
+{
+  if (num_threads == 0)
+    throw std::invalid_argument(
+      "The number of threads must be greater than zero!");
+
+  for (std::size_t i = 0; i < num_threads; ++i)
+    {
+      workers.emplace_back([this]() { // Worker thread function
+        while (true)
+          {
+            std::function<void()> job;
+
+            {
+              // TODO: Check if jobs are in the queue. If yes take a job and
+              // execute it. If not, wait until a job is available or the pool
+              // is stopping. If the pool is stopping and there are no more
+              // jobs, exit the thread function.
+              std::unique_lock<std::mutex> lock(
+                queue_mutex); // Lock the mutex to access the job queue
+
+              queue_condition.wait(
+                lock,
+                [this]() { // It temporarily releases the lock and puts the
+                           // thread into a highly efficient sleep state
+                  return !jobs.empty() || stop_thread_pool;
+                });
+
+              if (stop_thread_pool && jobs.empty())
+                {
+                  if (active_jobs == 0)
+                    work_done_condition.notify_all();
+                  return;
+                }
+
+              job = std::move(
+                jobs.front()); // move the task to the front of the queue
+              jobs.pop();      // remove the job from the queue
+
+              active_jobs++;
+            }
+
+            job(); // call the job outside the lock to allow other threads to
+                   // access the queue
+
+            {
+              // Hint: Don't forget to check whether the job queue is empty
+              // after finishing the job and notify this via the
+              // work_done_condition if it is.
+              std::unique_lock<std::mutex> lock(
+                queue_mutex); // lock the mutex to safely update the shared pool
+                              // status
+              active_jobs--;
+
+              if (jobs.empty() && active_jobs == 0)
+                work_done_condition.notify_all();
+            }
+          }
+      });
+    }
+}
+
+inline ThreadPool::~ThreadPool() noexcept
+{
+  {
+    std::unique_lock<std::mutex> lock(queue_mutex);
+    stop_thread_pool = true; // Signal all threads to stop
+  }
+  queue_condition.notify_all(); // Wake up all threads to check the stop flag
+
+  // Join all worker threads
+  for (std::thread &worker : workers)
+    if (worker.joinable())
+      worker.join();
+}
+
+inline void
+ThreadPool::enqueue(std::function<void()> job)
+{
+  {
+    std::unique_lock<std::mutex> lock(queue_mutex); // Lock the mutex
+    jobs.push(std::move(job));                      // Add the job to the queue
+  }
+  queue_condition.notify_one();
+}
+
+inline void
+ThreadPool::wait_for_all()
+{
+  std::unique_lock<std::mutex> lock(queue_mutex); // Lock the mutex
+
+  work_done_condition.wait(lock, [this]() { // Wait until all jobs are processed
+    return jobs.empty() && active_jobs == 0;
+  });
+}

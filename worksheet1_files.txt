@@ -1,0 +1,601 @@
+LA_MATRIX.hpp
+
+/**
+ * @brief Represents a mathematical matrix for linear algebra operations.
+ *
+ * This class provides the foundation for performing standard matrix operations
+ * such as addition, multiplication and more. It can be extended  to support
+ * advanced functionality as needed.
+ */
+
+#pragma once
+
+#include <i2phpp/linear_algebra/la_vector.hpp>
+#include <i2phpp/util/asserts.hpp>
+
+#include <utility>
+#include <vector>
+
+namespace i2phpp
+{
+  template <typename number>
+  class LaMatrix
+  {
+  public:
+    /**
+     * Default constructor. Constructs an empty 0x0 matrix.
+     */
+    LaMatrix() = default;
+
+    /**
+     * Constructs a matrix with the specified dimensions and initializes all
+     * entries to the given value.
+     *
+     * @param n_rows Number of rows in the matrix.
+     * @param n_cols Number of columns in the matrix.
+     * @param initial_value Value to assign to each element in the matrix.
+     */
+    LaMatrix(std::size_t n_rows,
+             std::size_t n_cols,
+             number      initial_value = number(0));
+
+    /**
+     * Creates an identity matrix of size n x n.
+     *
+     * @param n The size of the identity matrix (number of rows and columns).
+     * @return An n x n identity matrix.
+     */
+    static LaMatrix<number>
+    identity(std::size_t n);
+
+    /**
+     * Returns the value at the specified matrix index (row_idx, col_idx).
+     * Performs bounds checking and throws on invalid indices. This prevents
+     * segmentation faults at the cost of additional runtime overhead.
+     *
+     * @param row_idx Row index.
+     * @param col_idx Column index.
+     *
+     * @return Value at the specified index.
+     */
+    number &
+    at(std::size_t row_idx, std::size_t col_idx);
+
+    /**
+     * Same as above but returns a const reference.
+     */
+    const number &
+    at(std::size_t row_idx, std::size_t col_idx) const;
+
+    /**
+     * Returns the number of rows in the matrix.
+     */
+    std::size_t
+    rows() const;
+
+    /**
+     * Returns the number of columns in the matrix.
+     */
+    std::size_t
+    cols() const;
+
+    /**
+     * Returns the dimensions of the matrix.
+     *
+     * @return A pair (rows, columns) representing the matrix size.
+     */
+    [[nodiscard]] std::pair<std::size_t, std::size_t>
+    size() const noexcept;
+
+    /**
+     * Resizes the matrix to the specified number of rows and columns. Existing
+     * data is preserved where possible. If the new size is larger, new elements
+     * are initialized with zero. If the new size is smaller,  existing elements
+     * which are out of bounds for the new size are discarded.
+     *
+     * @param new_n_rows New number of rows.
+     * @param new_n_cols New number of columns.
+     */
+    void
+    resize(std::size_t new_n_rows, std::size_t new_n_cols);
+
+    /**
+     * Computes and returns the trace of the matrix (sum of diagonal elements).
+     * Throws an exception if the matrix is not square.
+     *
+     * @return The trace of the matrix.
+     */
+    number
+    trace() const;
+
+    /**
+     * Computes the transpose of the matrix.
+     *
+     * @return The transpose of the matrix.
+     */
+    LaMatrix
+    transpose() const;
+
+    /**
+     * Returns a const reference to the value at the specified index.
+     *
+     * @param row Row index.
+     * @param col Column index.
+     *
+     * @return Value at the specified index.
+     */
+    const number &
+    operator[](std::size_t row, std::size_t col) const;
+
+    /**
+     * Returns a writable reference to the value at the specified index.
+     *
+     * @param row Row index.
+     * @param col Column index.
+     *
+     * @return Reference to the value at the specified index.
+     */
+    number &
+    operator[](std::size_t row, std::size_t col);
+
+    /**
+     * Returns a new matrix representing the element-wise sum of this matrix
+     * and the given matrix.
+     *
+     * @param mat Matrix to add.
+     *
+     * @return Sum of the two matrices.
+     */
+    LaMatrix<number>
+    operator+(const LaMatrix<number> &mat) const;
+
+    /**
+     * Performs in-place element-wise addition with the given matrix.
+     *
+     * @param mat Matrix to add.
+     */
+    LaMatrix<number> &
+    operator+=(const LaMatrix<number> &mat);
+
+    /**
+     * Returns a new matrix representing the element-wise difference between
+     * this matrix and the given matrix.
+     *
+     * @param mat Matrix to subtract.
+     *
+     * @return Resulting matrix after subtraction.
+     */
+    LaMatrix<number>
+    operator-(const LaMatrix<number> &mat) const;
+
+    /**
+     * Performs in-place element-wise subtraction with the given matrix.
+     *
+     * @param mat Matrix to subtract.
+     */
+    LaMatrix<number> &
+    operator-=(const LaMatrix<number> &mat);
+
+    /**
+     * Returns the matrix product of this matrix and the given matrix.
+     *
+     * @param mat Matrix to multiply with.
+     *
+     * @return Resulting matrix after multiplication.
+     */
+    LaMatrix<number>
+    operator*(const LaMatrix<number> &mat) const;
+
+    /**
+     * Returns the result of multiplying this matrix with the given vector.
+     *
+     * @param vec Vector to multiply with.
+     *
+     * @return Resulting vector.
+     */
+    LaVector<number>
+    operator*(const LaVector<number> &vec) const;
+
+    /**
+     * Returns a new matrix resulting from scalar multiplication.
+     *
+     * @param num Scalar multiplier.
+     *
+     * @return Scaled matrix.
+     */
+    LaMatrix<number>
+    operator*(number num) const;
+
+    /**
+     * Performs in-place scalar multiplication on the matrix.
+     *
+     * @param num Scalar multiplier.
+     */
+    LaMatrix<number> &
+    operator*=(number num);
+
+    /**
+     * Returns a new matrix resulting from scalar division.
+     *
+     * @param num Scalar divisor.
+     *
+     * @return Scaled matrix.
+     */
+    LaMatrix<number>
+    operator/(number num) const;
+
+    /**
+     * Performs in-place scalar division on the matrix.
+     *
+     * @param num Scalar divisor.
+     */
+    LaMatrix<number> &
+    operator/=(number num);
+
+    /**
+     * Applies the given function to each element of the matrix, modifying the
+     * matrix in-place.
+     *
+     * @param func The function to apply to each element. It should take a number as
+     * input and return a which represents the transformed value replacing the
+     * original value in the matrix.
+     */
+    void
+    apply(const std::function<number(number)> &func);
+
+    /**
+     * @brief Swaps the data of this matrix with another matrix using the swap
+     * function of the underlying data structure.
+     *
+     * @param other The LaMatrix object whose data is to be swapped with this
+     * object.
+     */
+    void
+    swap(LaMatrix<number> &other);
+
+  private:
+    /// Internal storage for the matrix elements.
+    std::vector<std::vector<number>> data{};
+  };
+} // namespace i2phpp
+
+
+
+
+
+LA_VECTOR.hpp
+
+/**
+ * @file la_vector.h
+ * @brief Represents a mathematical vector for use in linear algebra operations.
+ *
+ * This class models a one-dimensional array of numerical values and supports
+ * operations such as dot product, scaling and more. It is designed to work
+ * seamlessly with matrix operations and can be extended to support additional
+ * vector-specific functionality.
+ */
+
+#pragma once
+
+#include <i2phpp/util/asserts.hpp>
+
+#include <functional>
+#include <vector>
+
+
+
+namespace i2phpp
+{
+  /**
+   * @brief Represents a mathematical vector for linear algebra operations.
+   *
+   * @tparam number The numerical type of the vector elements (e.g., float,double).
+   * @tparam N The vectorization width.
+   */
+  template <typename number>
+  class LaVector
+  {
+  public:
+    /**
+     * Default constructor, initializes an empty vector.
+     */
+    LaVector() = default;
+
+    /**
+     * Constructor that creates a vector with @param size elements and
+     * initializes all elements with the value of @param initial_value.
+     *
+     * @param size The number of elements in the vector.
+     * @param initial_value The value to initialize each element with.
+     */
+    explicit LaVector(std::size_t size, number initial_value = number(0.));
+
+    /**
+     * Constructor that initializes the vector with the values from the provided
+     * @param container.
+     *
+     * @param container A std::vector containing the values to initialize the
+     * vector.
+     */
+    explicit LaVector(const std::vector<number> &container);
+
+    /**
+     * Returns the value at the specified @param index in the vector, checking
+     * whether the index is within the valid range.
+     *
+     * @param index The index of the element to access.
+     * @return The value at the specified index.
+     */
+    number &
+    at(std::size_t index);
+
+    /**
+     * As above but returns a const reference.
+     */
+    const number &
+    at(std::size_t index) const;
+
+    /**
+     * Returns the size of the vector (i.e. the number of elements it contains).
+     *
+     * @return The size of the vector.
+     */
+    [[nodiscard]] std::size_t
+    size() const noexcept;
+
+    /**
+     * Resizes the vector to a new size (@param new_size). Existing elements are
+     * preserved, and new elements are initialized with @param init_value.
+     *
+     * @param new_size The new size of the vector.
+     * @param init_value The value to initialize the new elements with.
+     */
+    void
+    resize(std::size_t new_size, number init_value = number(0.0));
+
+    /**
+     * Returns the dot product of the current vector and the provided
+     * @param other vector.
+     *
+     * @param other The vector to compute the dot product with.
+     * @return The dot product of the two vectors.
+     */
+    number
+    dot_product(const LaVector<number> &other) const;
+
+    /**
+     * Returns an iterator pointing to the first element in the vector.
+     *
+     * @return An iterator to the first element.
+     */
+    typename std::vector<number>::iterator
+    begin();
+
+    /**
+     * Const version of the above iterator.
+     */
+    typename std::vector<number>::const_iterator
+    begin() const;
+
+    /**
+     * Returns an iterator pointing to one element after the last element in the
+     * vector.
+     *
+     * @return An iterator to one element after the last element.
+     */
+    typename std::vector<number>::iterator
+    end();
+
+    /**
+     * Const version of the above iterator.
+     */
+    typename std::vector<number>::const_iterator
+    end() const;
+
+    /**
+     * Returns a const reference of the value at the specified @param index in the vector.
+     *
+     * @param index The index of the element to access.
+     * @return A const reference to the value at the specified index.
+     */
+    const number &
+    operator[](std::size_t index) const;
+
+    /**
+     * Returns a writable reference to the value at the specified @param index
+     * in the vector.
+     *
+     * @param index The index of the element to access.
+     * @return A reference to the value at the specified index.
+     */
+    number &
+    operator[](std::size_t index);
+
+    /**
+     * Sets all values in the vector to the specified parameter.
+     *
+     * @param value Value to which the vector elements are set.
+     */
+    void
+    set_all(number value);
+
+    /**
+     * Adds the given vector @param vec to the current vector and returns the
+     * resulting vector.
+     *
+     * @param vec The vector to add.
+     * @return The sum of the current vector and @param vec.
+     */
+    LaVector<number>
+    operator+(const LaVector<number> &vec) const;
+
+    /**
+     * Adds the given vector @param vec to the current vector, modifying the
+     * current vector.
+     *
+     * @param vec The vector to add.
+     */
+    LaVector<number> &
+    operator+=(const LaVector<number> &vec);
+
+    /**
+     * Subtracts the given vector @param vec from the current vector and returns
+     * the resulting vector.
+     *
+     * @param vec The vector to subtract.
+     * @return The difference between the current vector and @param vec.
+     */
+    LaVector<number>
+    operator-(const LaVector<number> &vec) const;
+
+    /**
+     * Subtracts the given vector @param vec from the current vector, modifying
+     * the current vector.
+     *
+     * @param vec The vector to subtract.
+     */
+    LaVector<number> &
+    operator-=(const LaVector<number> &vec);
+
+    /**
+     * Multiplies each element of the current vector by the scalar @param num
+     * and returns the resulting vector.
+     *
+     * @param num The scalar to multiply with.
+     * @return The scaled vector.
+     */
+    LaVector<number>
+    operator*(number num) const;
+
+    /**
+     * Multiplies each element of the current vector by the scalar @param num
+     * modifying the current vector.
+     *
+     * @param num The scalar to multiply with.
+     */
+    LaVector<number> &
+    operator*=(number num);
+
+    /**
+     * Divides each element of the current vector by the scalar @param num
+     * and returns the resulting vector.
+     *
+     * @param num The scalar to multiply with.
+     * @return The scaled vector.
+     */
+    LaVector<number>
+    operator/(number num) const;
+
+    /**
+     * Divides each element of the current vector by the scalar @param num
+     * modifying the current vector.
+     *
+     * @param num The scalar to multiply with.
+     */
+    LaVector<number> &
+    operator/=(number num);
+
+    /**
+     * Check if two vectors are equal. This is the case if they have the same
+     * dimensions and all corresponding elements are equal.
+     *
+     * @param other The vector to compare with.
+     * @return True if the vectors are equal, false otherwise.
+     */
+    bool
+    operator==(const LaVector<number> &other) const;
+
+    /**
+     * Check if two vectors are not equal. This is the case if they have
+     * different dimensions or at least one pair of corresponding elements are
+     * not equal.
+     *
+     * @param other The vector to compare with.
+     * @return True if the vectors are not equal, false otherwise.
+     */
+    bool
+    operator!=(const LaVector<number> &other) const;
+
+    /**
+     * @brief Swaps the data of this vector with another vector using the swap
+     * function of the underlying data structure.
+     *
+     * @param other The LaVector object whose data is to be swapped with this
+     * object.
+     */
+    void
+    swap(LaVector<number> &other);
+
+    /**
+     * Computes the square of the L2 norm of the vector.
+     *
+     * @return The square of the L2 norm.
+     */
+    number
+    l2_norm_squared() const;
+
+    /**
+     * Computes the L2 norm of the vector.
+     *
+     * @return The L2 norm.
+     */
+    number
+    norm_l2() const;
+
+    /**
+     * Computes the L1 norm of the vector.
+     *
+     * @return The L1 norm.
+     */
+    number
+    norm_l1() const;
+
+    /**
+     * Computes the L-infinity norm of the vector.
+     *
+     * @return The L-infinity norm.
+     */
+    number
+    norm_linf() const;
+
+    /**
+     * Computes the Schur (element-wise) product of two vectors.
+     *
+     * @param other The vector to multiply with.
+     * @return The Schur product.
+     */
+    LaVector<number>
+    schur_product(const LaVector<number> &other) const;
+
+    /**
+     * Applies the given function to each element of the vector, modifying the
+     * vector in-place.
+     *
+     * @param func The function to apply to each element. It should take a number as
+     * input and return a which represents the transformed value replacing the
+     * original value in the vector.
+     */
+    void
+    apply(const std::function<number(number)> &func);
+
+    /**
+     * Normalizes the vector in-place, making its L2 norm equal to 1.
+     */
+    void
+    normalize();
+
+    /**
+     * Get the underlying vector. This function is not intended to be used in
+     * the course but only required for plotting.
+     */
+    const std::vector<number> &
+    get_data() const
+    {
+      return data;
+    }
+
+  private:
+    /// Internal storage for the vector elements.
+    std::vector<number> data{};
+  };
+} // namespace i2phpp
