@@ -798,7 +798,7 @@ for (std::size_t i = 0; i < n; ++i) {
 ```
 
 
-* **Loop Reduction & `nowait**`:
+* **Loop Reduction & `nowait`**:
 ```cpp
 // 'nowait' removes the implicit barrier at the end of the loop construct[cite: 1]
 #pragma omp for reduction(max : max_val) schedule(dynamic, 10) nowait[cite: 1]
