@@ -663,3 +663,208 @@ inline ThreadPool::~ThreadPool() noexcept
 | **Why is a predicate necessary in `cv.wait()`?** | Guards against **spurious wakeups** (OS waking a thread without a signal) and race conditions where another thread steals the job first.|
 | **Difference between `queue_condition` and `work_done_condition`?** | `queue_condition` signals **workers** that tasks are available; `work_done_condition` signals **external callers** (`wait_for_all`) that all tasks are finished.|
 | **What happens if a thread pool is destroyed while tasks are active?** | The destructor sets `stop_thread_pool = true`, wakes sleeping threads, allows running tasks to complete, and joins all workers gracefully (RAII).|
+
+
+---
+
+# Open MP
+
+### 1. Architecture & Execution Model
+
+* **Parallel Framework**: OpenMP (Open Multi-Processing) is a standardized API for shared-memory parallel programming in C, C++, and Fortran. It targets MIMD (Multiple Instruction, Multiple Data) architectures.
+
+
+* **Three Key Components**:
+1. **Compiler Directives**: Pragma directives (`#pragma omp ...`) that instruct the compiler to parallelize code blocks.
+
+
+2. **Runtime Library Routines**: Functions accessed via `#include <omp.h>` (e.g., `omp_get_thread_num()`, `omp_get_num_threads()`).
+
+
+3. **Environment Variables**: External configurations affecting execution runtime behavior (e.g., `OMP_NUM_THREADS`).
+
+
+
+
+* **Compilation Flag**: Requires enabling compiler flag `-fopenmp` during compilation.
+
+
+* **Fork-Join Execution Model**:
+* Execution begins with a single **master thread**.
+
+
+* Upon reaching a parallel construct, the master thread **forks** a team of threads.
+
+
+* At the end of the construct, threads **join** back together, and only the master thread continues sequentially.
+
+
+
+
+
+---
+
+### 2. Loop Scheduling Strategies
+
+OpenMP loop iterations are distributed among threads using different scheduling policies specified via the `schedule()` clause:
+
+| Scheduling Policy | Syntax Example | Key Use Case & Behavior |
+| --- | --- | --- |
+| **Static** | `schedule(static, chunk_size)`<br> | Best when iteration execution time is constant and predictable. Chunks are assigned round-robin at compile-time/start.|
+| **Dynamic** | `schedule(dynamic, chunk_size)`<br> | Best when iteration execution time varies significantly. Chunks are assigned to idle threads dynamically at runtime.|
+| **Guided** | `schedule(guided, min_size)`<br> | Hybrid approach where chunk sizes start large and exponentially decrease down to `min_size` as work completes.|
+
+---
+
+## Data-Sharing Attributes & Scoping Rules
+
+When entering a parallel region, data scope must be carefully managed to avoid race conditions or unexpected state modifications:
+
+* **`shared(var)`**: A single memory location is accessed and modified by all threads in the team.
+
+
+* **`private(var)`**: Each thread gets its own uninitialized copy of the variable. The original value outside the region is unchanged.
+
+
+* **`firstprivate(var)`**: Each thread gets its own private copy initialized with the value the variable had before entering the parallel region.
+
+
+* **`lastprivate(var)`**: The private value from the logically last loop iteration is written back to the outer shared variable after the loop finishes.
+
+
+* **`default(none)`**: Forces the programmer to explicitly state the scope of every variable used inside the parallel region, preventing accidental scoping bugs.
+
+
+* **`reduction(op : var)`**: Creates local private copies of `var` per thread, performs operations locally, and combines them into the global `var` using operator `op` (e.g., `+`, `min`, `max`) at loop completion.
+
+
+
+---
+
+## Code Syntax Breakdown (Live Coding Examples)
+
+### 1. Parallel Region & Nesting
+
+```cpp
+omp_set_max_active_levels(2); // Enables nested parallel regions up to 2 levels deep[cite: 1]
+
+#pragma omp parallel num_threads(2) // Spawns a parallel region with 2 threads[cite: 1]
+{
+    int id = omp_get_thread_num(); // Returns current thread ID[cite: 1]
+    int total = omp_get_num_threads(); // Returns total thread count[cite: 1]
+    
+    #pragma omp parallel num_threads(2) // Nested parallel region[cite: 1]
+    {
+        // Executes inside child threads[cite: 1]
+    }
+
+    #pragma omp barrier // Explicit barrier: all threads wait here before proceeding[cite: 1]
+}
+
+```
+
+### 2. Synchronization & Single-Threaded Sections
+
+* **Mutual Exclusion (`critical`)**:
+```cpp
+#pragma omp critical // Ensures only 1 thread executes this block at a time[cite: 1]
+{
+    ++counter; // Thread-safe state update[cite: 1]
+}
+
+```
+
+
+* **Single Execution (`single`)**:
+```cpp
+#pragma omp single // Executed by only ONE thread; other threads wait at implicit barrier[cite: 1]
+{
+    std::cout << "Initialization task by one thread\n";[cite: 1]
+} // Implicit barrier unless 'nowait' is added[cite: 1]
+
+```
+
+
+
+### 3. Loop Worksharing & Advanced Loop Directives
+
+* **Automatic Worksharing Loop (`omp for`)**:
+```cpp
+#pragma omp for schedule(static, 73)[cite: 1]
+for (std::size_t i = 0; i < n; ++i) {
+    c[i] = a[i] + b[i];[cite: 1]
+}
+
+```
+
+
+* **Loop Reduction & `nowait**`:
+```cpp
+// 'nowait' removes the implicit barrier at the end of the loop construct[cite: 1]
+#pragma omp for reduction(max : max_val) schedule(dynamic, 10) nowait[cite: 1]
+for (std::size_t i = 0; i < n; ++i) {
+    max_val = std::max(max_val, c[i]);[cite: 1]
+}
+
+```
+
+
+* **Loop Collapsing (`collapse(N)`)**:
+```cpp
+// Combines 2 nested loops into 1 single multi-dimensional iteration space[cite: 1]
+#pragma omp parallel for num_threads(2) schedule(static, 1) collapse(2)[cite: 1]
+for (int i = 0; i < 2; ++i) {
+    for (int j = 0; j < 3; ++j) {
+        // Process element (i, j)[cite: 1]
+    }
+}
+
+```
+
+
+* **Enforced Iteration Order (`ordered`)**:
+```cpp
+#pragma omp parallel for ordered num_threads(4)[cite: 1]
+for (int i = 0; i < 8; ++i) {
+    // Parallel computations[cite: 1]
+
+    #pragma omp ordered // Forces execution sequentially in logical order of i[cite: 1]
+    {
+        std::cout << "Processing item " << i << "\n";[cite: 1]
+    }
+}
+
+```
+
+
+
+### 4. Manual Worksharing Math
+
+When not using `#pragma omp for`, work can be manually divided using thread IDs:
+
+
+$$\text{start\_index} = \frac{\text{thread\_id} \cdot n}{\text{n\_threads}}$$
+
+$$\text{end\_index} = \begin{cases} n & \text{if } \text{thread\_id} = \text{n\_threads} - 1 \\ \frac{(\text{thread\_id} + 1) \cdot n}{\text{n\_threads}} & \text{otherwise} \end{cases}$$
+
+---
+
+## Key Oral Exam & Worksheet Takeaways
+
+> ### Essential Exam Takeaways
+> 
+> 
+> 1. **Default Synchronization Points**: Most worksharing directives (`#pragma omp for`, `#pragma omp single`) feature an **implicit barrier** at the end unless explicitly overridden using the `nowait` clause.
+> 
+> 
+> 2. **Race Conditions vs. Atomic/Critical**: Shared updates without `#pragma omp critical`, `#pragma omp atomic`, or `reduction` lead to data races.
+> 
+> 
+> 3. **Data Scoping Rigor**: Always use `default(none)` in complex regions to prevent uninitialized private variables (`private`) or unexpected modifications to shared variables (`shared`).
+> 
+> 
+> 4. **Scheduling Tradeoffs**: `static` scheduling has minimal overhead but suffers from load imbalance if iterations take varying time. `dynamic` fixes load imbalance but introduces runtime overhead for chunk distribution.
+> 
+> 
+> 
+>
